@@ -15,7 +15,8 @@ const os = require('os');
 const SMOKE = process.argv.includes('--smoke');
 const SHOT_EDITOR = process.argv.includes('--shot-editor');
 const THEME_ARG = process.argv.find((arg) => arg.startsWith('--theme='));
-const THEME = THEME_ARG ? THEME_ARG.slice('--theme='.length) : null;const SHOT = process.argv.includes('--shot') || SHOT_EDITOR;
+const THEME = THEME_ARG ? THEME_ARG.slice('--theme='.length) : null;
+const SHOT = process.argv.includes('--shot') || SHOT_EDITOR;
 const MAX_BOARD_BYTES = 5 * 1024 * 1024;
 const SMOKE_TIMEOUT_MS = 90 * 1000;
 const SHOT_TIMEOUT_MS = 60 * 1000;
@@ -109,9 +110,11 @@ function registerIpc() {
 
 function createWindow() {
   const iconPath = path.join(__dirname, '..', 'build', 'icon.png');
+  // Кадры для README: окно побольше, чтобы capturePage давал ~1900px —
+  // после даунскейла гитхабом текст остаётся резким.
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: SHOT ? 1920 : 1280,
+    height: SHOT ? 1080 : 820,
     minWidth: 860,
     minHeight: 560,
     show: false,
