@@ -23,6 +23,16 @@
 
 ## Установка и запуск
 
+### Готовые сборки
+
+Скачай из раздела [Releases](https://github.com/Neuro-Storm/kanban/releases):
+
+- **Linux** — `kanban-1.0.0-x86_64.AppImage`: `chmod +x` и запустить.
+- **Windows** — `kanban-setup-1.0.0.exe`: обычный установщик (NSIS).
+- **macOS** — собирается из исходников командой `npm run dist:mac` (нужен macOS).
+
+### Из исходников
+
 Нужен Node.js 20+ и npm.
 
 ```bash
