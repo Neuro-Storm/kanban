@@ -16,9 +16,9 @@
     "smoke": "bash scripts/smoke.sh",
     "shot": "bash scripts/shot.sh",
     "icon": "bash scripts/make-icon.sh",
-    "dist": "electron-builder --linux AppImage",
-    "dist:win": "electron-builder --win nsis",
-    "dist:mac": "electron-builder --mac dmg"
+    "dist": "electron-builder --linux AppImage --publish never",
+    "dist:win": "electron-builder --win nsis --publish never",
+    "dist:mac": "electron-builder --mac dmg --publish never"
   },
   "devDependencies": {
     "electron": "^44.3.0",
@@ -52,7 +52,7 @@
     },
     "mac": {
       "target": ["dmg"],
-      "icon": "build/icon.png",
+      "icon": "build/icon-512.png",
       "category": "public.app-category.productivity"
     }
   }
