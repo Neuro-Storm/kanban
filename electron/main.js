@@ -110,9 +110,11 @@ function registerIpc() {
 
 function createWindow() {
   const iconPath = path.join(__dirname, '..', 'build', 'icon.png');
+  // Кадр для README: окно 1720px + зум контента 1.25 = компоновка шире 1280,
+  // стикеры и шрифт крупнее в пикселях, всё влезает без прокрутки.
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: SHOT ? 1720 : 1280,
+    height: SHOT ? 1080 : 820,
     minWidth: 860,
     minHeight: 560,
     show: false,
@@ -127,6 +129,8 @@ function createWindow() {
       sandbox: true,
       spellcheck: false,
       backgroundThrottling: false,
+      // Зум только для кадров: масштабирует контент, а не окно.
+      ...(SHOT ? { zoomFactor: 1.25 } : {}),
     },
   });
 
