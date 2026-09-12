@@ -1,6 +1,8 @@
 node_modules/
 dist/
-artifacts/
+artifacts/*
+!artifacts/preview.png
+!artifacts/preview-editor.png
 *.log
 .DS_Store
 Thumbs.db
