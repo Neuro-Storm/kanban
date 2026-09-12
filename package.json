@@ -41,7 +41,6 @@
       "target": ["AppImage"],
       "category": "Utility",
       "executableName": "kanban",
-      "desktopName": "kanban.desktop",
       "syncDesktopName": true,
       "artifactName": "kanban-${version}-${arch}.${ext}",
       "icon": "build/icon.png"
