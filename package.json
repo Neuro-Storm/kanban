@@ -53,6 +53,7 @@
     "mac": {
       "target": ["dmg"],
       "icon": "build/icon-512.png",
+      "artifactName": "kanban-${version}-${arch}.${ext}",
       "category": "public.app-category.productivity"
     }
   }
