@@ -1,0 +1,58 @@
+{
+  "name": "kanban-desktop",
+  "productName": "Канбан",
+  "version": "1.0.0",
+  "description": "Канбан-доска как рабочий лист со стикерами: свободное перетаскивание, WIP-лимиты, автосохранение. Без облака, всё локально.",
+  "main": "electron/main.js",
+  "author": "Neuro-Storm",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Neuro-Storm/kanban.git"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/unit.test.cjs",
+    "smoke": "bash scripts/smoke.sh",
+    "shot": "bash scripts/shot.sh",
+    "icon": "bash scripts/make-icon.sh",
+    "dist": "electron-builder --linux AppImage",
+    "dist:win": "electron-builder --win nsis",
+    "dist:mac": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "org.neurostorm.kanban",
+    "productName": "Канбан",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Utility",
+      "executableName": "kanban",
+      "artifactName": "kanban-${version}-${arch}.${ext}",
+      "icon": "build/icon.png"
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "build/icon.png",
+      "artifactName": "kanban-setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "build/icon.png",
+      "category": "public.app-category.productivity"
+    }
+  }
+}
