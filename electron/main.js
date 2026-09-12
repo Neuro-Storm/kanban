@@ -110,11 +110,9 @@ function registerIpc() {
 
 function createWindow() {
   const iconPath = path.join(__dirname, '..', 'build', 'icon.png');
-  // Кадры для README: окно побольше, чтобы capturePage давал ~1900px —
-  // после даунскейла гитхабом текст остаётся резким.
   mainWindow = new BrowserWindow({
-    width: SHOT ? 1920 : 1280,
-    height: SHOT ? 1080 : 820,
+    width: 1280,
+    height: 820,
     minWidth: 860,
     minHeight: 560,
     show: false,
