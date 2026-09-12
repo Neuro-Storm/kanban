@@ -1,6 +1,9 @@
 /*
  * Юнит-тесты ядра доски. Гоняются чистым Node (node --test), UI не нужен.
  * Запуск: npm test
+ *
+ * У стикера единый текст (поле text): первая строка и остаток не разделяются
+ * на заголовок/заметку ни в ядре, ни в интерфейсе.
  */
 'use strict';
 
@@ -42,26 +45,26 @@ test('стартовая доска: пять колонок, задачи ра�
 test('создание: новая задача встаёт наверх колонки', () => {
   const { store } = makeStore();
   const before = store.view().columns.find((column) => column.id === 'pool').tasks.map((task) => task.id);
-  const result = store.createTask({ columnId: 'pool', title: 'Сверху' });
+  const result = store.createTask({ columnId: 'pool', text: 'Сверху' });
   assert.equal(result.ok, true);
   const after = store.view().columns.find((column) => column.id === 'pool').tasks.map((task) => task.id);
   assert.equal(after[0], result.task.id);
   assert.deepEqual(after.slice(1), before);
 });
 
-test('создание: пустой заголовок отклоняется', () => {
+test('создание: пустой текст отклоняется', () => {
   const { store } = makeStore();
-  const result = store.createTask({ columnId: 'pool', title: '   ' });
+  const result = store.createTask({ columnId: 'pool', text: '   \n  ' });
   assert.equal(result.ok, false);
-  assert.equal(result.reason, 'empty-title');
+  assert.equal(result.reason, 'empty-text');
 });
 
 test('WIP-лимит: вход в переполненную колонку отклоняется и при создании, и при переносе', () => {
   const { store } = makeStore();
   // В колонке «в работе» лимит 3, уже 1 задача из стартовой доски.
-  store.createTask({ columnId: 'in-progress', title: 'Раз' });
-  store.createTask({ columnId: 'in-progress', title: 'Два' });
-  const blockedCreate = store.createTask({ columnId: 'in-progress', title: 'Три — уже нельзя' });
+  store.createTask({ columnId: 'in-progress', text: 'Раз' });
+  store.createTask({ columnId: 'in-progress', text: 'Два' });
+  const blockedCreate = store.createTask({ columnId: 'in-progress', text: 'Три — уже нельзя' });
   assert.equal(blockedCreate.ok, false);
   assert.equal(blockedCreate.reason, 'wip');
 
@@ -82,7 +85,7 @@ test('перемещение: между двумя задачами даёт д
   const { store } = makeStore();
   const pool = store.view().columns.find((column) => column.id === 'pool');
   const [first, second] = pool.tasks;
-  const created = store.createTask({ columnId: 'pool', title: 'В серединку' });
+  const created = store.createTask({ columnId: 'pool', text: 'В серединку' });
   const result = store.moveTask(created.task.id, 'pool', { afterId: first.id, beforeId: second.id });
   assert.equal(result.ok, true);
   const order = store.view().columns.find((column) => column.id === 'pool').tasks.map((task) => task.id);
@@ -112,7 +115,7 @@ test('порядок не вырождается при серии вставо�
   const anchor = pool.tasks[0];
   const below = pool.tasks[1];
   for (let index = 0; index < 40; index += 1) {
-    const created = store.createTask({ columnId: 'pool', title: `Щель ${index}` });
+    const created = store.createTask({ columnId: 'pool', text: `Щель ${index}` });
     const result = store.moveTask(created.task.id, 'pool', { afterId: anchor.id, beforeId: below.id });
     assert.equal(result.ok, true);
   }
@@ -123,31 +126,30 @@ test('порядок не вырождается при серии вставо�
   assert.equal(unique.size, finalOrder.length, 'порядки не должны дублироваться');
 });
 
-test('правка: смена заголовка, метки, цвета, срока и флага', () => {
+test('правка: смена текста, метки, цвета, срока и флага', () => {
   const { store } = makeStore();
   const result = store.updateTask('seed-2', {
-    title: 'Новый заголовок',
-    note: 'Заметка',
+    text: 'Новый текст\nВторая строка',
     tag: 'work',
     color: 'pink',
     dueDate: '2026-09-20',
     priority: true,
   });
   assert.equal(result.ok, true);
-  assert.equal(result.task.title, 'Новый заголовок');
+  assert.equal(result.task.text, 'Новый текст\nВторая строка');
   assert.equal(result.task.tag, 'work');
   assert.equal(result.task.color, 'pink');
   assert.equal(result.task.dueDate, '2026-09-20');
   assert.equal(result.task.priority, true);
 });
 
-test('правка: пустой заголовок отклоняется, состояние не меняется', () => {
+test('правка: пустой текст отклоняется, состояние не меняется', () => {
   const { store } = makeStore();
-  const before = store.getTask('seed-2').title;
-  const result = store.updateTask('seed-2', { title: '   ' });
+  const before = store.getTask('seed-2').text;
+  const result = store.updateTask('seed-2', { text: '   ' });
   assert.equal(result.ok, false);
-  assert.equal(result.reason, 'empty-title');
-  assert.equal(store.getTask('seed-2').title, before);
+  assert.equal(result.reason, 'empty-text');
+  assert.equal(store.getTask('seed-2').text, before);
 });
 
 test('правка: недопустимые метка и цвет сбрасываются в null', () => {
@@ -156,6 +158,86 @@ test('правка: недопустимые метка и цвет сбрасы
   assert.equal(result.ok, true);
   assert.equal(result.task.tag, null);
   assert.equal(result.task.color, null);
+});
+
+test('rich-текст: форматирование живёт, скрипты и мусор режутся', () => {
+  const { store } = makeStore();
+  const result = store.createTask({
+    columnId: 'pool',
+    text: '<b>Жир</b> и <i>курсив</i><script>alert(1)</script><div onclick="x()">текст</div>',
+  });
+  assert.equal(result.ok, true);
+  assert.match(result.task.text, /<b>Жир<\/b>/);
+  assert.match(result.task.text, /<i>курсив<\/i>/);
+  assert.doesNotMatch(result.task.text, /script/);
+  assert.doesNotMatch(result.task.text, /onclick/);
+});
+
+test('rich-текст: div превращается в перенос, span держит только размер', () => {
+  assert.equal(Core.sanitizeRich('первая<div>вторая</div>'), 'первая<br>вторая');
+  assert.equal(
+    Core.sanitizeRich('текст<span style="font-size:21px; color:red" onclick="x()">крупно</span>'),
+    'текст<span data-fs="21" style="font-size:21px">крупно</span>'
+  );
+  assert.equal(Core.strippedText('<b>Жир</b><br>plain'), 'Жирplain');
+});
+
+test('поиск ищет по тексту без учёта разметки', () => {
+  const { store } = makeStore();
+  store.updateTask('seed-2', { text: 'Собрать <b>синхрофазотрон</b> книг' });
+  store.setQuery('синхрофазотрон');
+  const view = store.view();
+  const visible = view.columns.reduce((sum, column) => sum + column.visibleCount, 0);
+  assert.equal(visible, 1);
+  store.setQuery('');
+});
+
+test('свободная позиция: setTaskXY двигает только x/y', () => {
+  const { store } = makeStore();
+  const before = store.getTask('seed-2');
+  const result = store.setTaskXY('seed-2', 123, 456);
+  assert.equal(result.ok, true);
+  assert.equal(result.task.x, 123);
+  assert.equal(result.task.y, 456);
+  assert.equal(result.task.columnId, before.columnId);
+  const bad = store.setTaskXY('seed-2', NaN, 10);
+  assert.equal(bad.ok, false);
+});
+
+test('групповой перенос: relocateTask меняет колонку и x/y, порядок тот же', () => {
+  const { store } = makeStore();
+  const before = store.getTask('seed-1');
+  const result = store.relocateTask('seed-1', 'waiting', 300, 400);
+  assert.equal(result.ok, true);
+  assert.equal(result.task.columnId, 'waiting');
+  assert.equal(result.task.x, 300);
+  assert.equal(result.task.order, before.order);
+  store.createTask({ columnId: 'in-progress', text: 'Раз' });
+  store.createTask({ columnId: 'in-progress', text: 'Два' });
+  const wip = store.relocateTask('seed-2', 'in-progress', 10, 10);
+  assert.equal(wip.ok, false);
+  assert.equal(wip.reason, 'wip');
+});
+
+test('тема: по умолчанию крафт, валидная ставится, мусор отклоняется', () => {
+  const { store } = makeStore();
+  assert.equal(store.getTheme(), 'kraft');
+  assert.equal(store.setTheme('cork').ok, true);
+  assert.equal(store.getTheme(), 'cork');
+  assert.equal(store.snapshot().theme, 'cork');
+  const bad = store.setTheme('бархат');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'bad-theme');
+  assert.equal(store.getTheme(), 'cork');
+});
+
+test('тема: санитизация сохраняет хорошую и чинит битую', () => {
+  const good = Core.sanitizeBoard({ columns: [], tasks: [], theme: 'graphite' }, Date.now());
+  assert.equal(good.board.theme, 'graphite');
+  const bad = Core.sanitizeBoard({ columns: [], tasks: [], theme: 'бархат' }, Date.now());
+  assert.equal(bad.board.theme, 'kraft');
+  const missing = Core.sanitizeBoard({ columns: [], tasks: [] }, Date.now());
+  assert.equal(missing.board.theme, 'kraft');
 });
 
 test('удаление: мягкое, возврат восстанавливает задачу', () => {
@@ -174,12 +256,12 @@ test('дублирование: копия встаёт следом за ори
   const pool = store.view().columns.find((column) => column.id === 'pool').tasks.map((task) => task.id);
   assert.equal(pool[0], 'seed-1');
   assert.equal(pool[1], result.task.id);
-  assert.match(result.task.title, /копия/);
+  assert.match(result.task.text, /копия/);
 });
 
 test('поиск: фильтрует видимые стикеры без изменения данных', () => {
   const { store } = makeStore();
-  store.updateTask('seed-2', { note: 'Уникальное слово синхрофазотрон' });
+  store.updateTask('seed-2', { text: 'Собрать список книг на осень синхрофазотрон' });
   store.setQuery('синхрофазотрон');
   const view = store.view();
   const visible = view.columns.reduce((sum, column) => sum + column.visibleCount, 0);
@@ -216,7 +298,7 @@ test('колонки: непустую и последнюю удалить не
 
 test('сохранение: изменение планирует запись, flush пишет версию и доску', () => {
   const { store, storage } = makeStore();
-  store.createTask({ columnId: 'pool', title: 'К сохранению' });
+  store.createTask({ columnId: 'pool', text: 'К сохранению' });
   assert.equal(store.hasPendingSave(), true);
   const result = store.flush();
   assert.equal(result.ok, true);
@@ -237,7 +319,7 @@ test('сохранение: ошибка диска не роняет доску
   };
   const store = new Core.KanbanStore({ storage, autosaveMs: 1 });
   store.init();
-  store.createTask({ columnId: 'pool', title: 'Упс' });
+  store.createTask({ columnId: 'pool', text: 'Упс' });
   const result = store.flush();
   assert.equal(result.ok, false);
   assert.match(store.lastSaveError(), /диск полон/);
@@ -253,11 +335,11 @@ test('санитизация: битые данные чинятся, хорош
         { id: 'pool', title: 'Дубль' },
       ],
       tasks: [
-        { id: 'a', columnId: 'pool', title: 'Живая', order: 1000 },
-        { id: 'b', columnId: 'нет-такой', title: 'Потеряшка', order: 500 },
-        { id: 'c', columnId: 'pool', title: '', order: 100 },
-        { id: 'd', columnId: 'pool', title: 'Дубль айди', order: 100 },
-        { id: 'a', columnId: 'pool', title: 'Дубликат id', order: 100 },
+        { id: 'a', columnId: 'pool', text: 'Живая', order: 1000 },
+        { id: 'b', columnId: 'нет-такой', text: 'Потеряшка', order: 500 },
+        { id: 'c', columnId: 'pool', text: '   ', order: 100 },
+        { id: 'd', columnId: 'pool', text: 'Дубль айди', order: 100 },
+        { id: 'a', columnId: 'pool', text: 'Дубликат id', order: 100 },
         null,
       ],
     },
@@ -269,12 +351,12 @@ test('санитизация: битые данные чинятся, хорош
   // санитизацию, а её порядок нормализуется.
   const poolView = store.view().columns[0];
   assert.deepEqual(
-    poolView.tasks.map((task) => task.title),
+    poolView.tasks.map((task) => task.text),
     ['Дубль айди', 'Потеряшка', 'Живая'],
     'после нормализации порядок задаётся исходными order'
   );
   assert.equal(
-    snapshot.tasks.find((task) => task.title === 'Потеряшка').columnId,
+    snapshot.tasks.find((task) => task.text === 'Потеряшка').columnId,
     'pool',
     'задача из неизвестной колонки едет в первую'
   );
@@ -293,8 +375,8 @@ test('санитизация: старые удалённые задачи вы�
     board: {
       columns: [{ id: 'pool', title: 'Пул' }],
       tasks: [
-        { id: 'old', columnId: 'pool', title: 'Стародавняя', order: 1000, deletedAt: old },
-        { id: 'new', columnId: 'pool', title: 'Свежая', order: 2000, deletedAt: Date.now() - 1000 },
+        { id: 'old', columnId: 'pool', text: 'Стародавняя', order: 1000, deletedAt: old },
+        { id: 'new', columnId: 'pool', text: 'Свежая', order: 2000, deletedAt: Date.now() - 1000 },
       ],
     },
   });
@@ -320,9 +402,9 @@ test('просроченные задачи считаются только вн
     board: {
       columns: [{ id: 'pool', title: 'Пул' }, { id: 'done', title: 'Готово', role: 'done' }],
       tasks: [
-        { id: 'late', columnId: 'pool', title: 'Просрочена', order: 1000, dueDate: '2020-01-01' },
-        { id: 'late-done', columnId: 'done', title: 'Просрочена, но закрыта', order: 1000, dueDate: '2020-01-01' },
-        { id: 'future', columnId: 'pool', title: 'В будущем', order: 2000, dueDate: '2099-01-01' },
+        { id: 'late', columnId: 'pool', text: 'Просрочена', order: 1000, dueDate: '2020-01-01' },
+        { id: 'late-done', columnId: 'done', text: 'Просрочена, но закрыта', order: 1000, dueDate: '2020-01-01' },
+        { id: 'future', columnId: 'pool', text: 'В будущем', order: 2000, dueDate: '2099-01-01' },
       ],
     },
   });
@@ -333,9 +415,9 @@ test('нормализация порядков сохраняет взаимн�
   const board = {
     columns: [{ id: 'a', title: 'A' }],
     tasks: [
-      { id: 'x', columnId: 'a', title: 'Икс', order: 5 },
-      { id: 'y', columnId: 'a', title: 'Игрек', order: 5 },
-      { id: 'z', columnId: 'a', title: 'Зет', order: 1 },
+      { id: 'x', columnId: 'a', text: 'Икс', order: 5 },
+      { id: 'y', columnId: 'a', text: 'Игрек', order: 5 },
+      { id: 'z', columnId: 'a', text: 'Зет', order: 1 },
     ],
   };
   const changed = Core.normalizeOrders(board);

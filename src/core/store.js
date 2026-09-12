@@ -42,7 +42,71 @@
 
   const COLORS = ['mint', 'yellow', 'peach', 'pink', 'blue', 'lilac'];
 
-  const LIMITS = { title: 300, note: 4000 };
+  // Темы оформления доски (id стабильны — хранятся в файле доски).
+  const THEMES = [
+    { id: 'kraft', label: 'Крафт' },
+    { id: 'rice', label: 'Рисовая бумага' },
+    { id: 'cork', label: 'Пробковая доска' },
+    { id: 'graphite', label: 'Графит' },
+    { id: 'chalk', label: 'Меловая доска' },
+  ];
+  const DEFAULT_THEME = 'kraft';
+
+  function sanitizeTheme(raw) {
+    return THEMES.some((entry) => entry.id === raw) ? raw : DEFAULT_THEME;
+  }
+
+  const LIMITS = { text: 4300, html: 12000 };
+
+  // Подмножество HTML для форматирования текста стикера
+  // (жирный/курсив/зачёркнутый/списки/размер шрифта).
+  const RICH_TAGS = new Set(['b', 'i', 's', 'u', 'ul', 'ol', 'li', 'br', 'span']);
+  const RICH_ALIAS = { strong: 'b', em: 'i', strike: 's', del: 's' };
+
+  // Чистит произвольный HTML до безопасного подмножества.
+  // Блочные div/p превращаются в переносы, скрипты и мусор вырезаются,
+  // у span остаётся только размер шрифта.
+  function sanitizeRich(html) {
+    let s = String(html || '');
+    s = s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+    s = s.replace(/<!--[\s\S]*?-->/g, '');
+    // Блочные div/p — в переносы: стык </div><div> даёт один <br>,
+    // иначе между соседними блоками появлялись бы пустые строки.
+    s = s.replace(/<\/(div|p)\s*>\s*<(div|p)[^>]*>/gi, '<br>');
+    s = s.replace(/<(div|p)[^>]*>/gi, '<br>');
+    s = s.replace(/<\/(div|p)\s*>/gi, '');
+    s = s.replace(/(<br\s*\/?>){3,}/gi, '<br><br>');
+    s = s.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/g, (match, tag) => {
+      tag = String(tag).toLowerCase();
+      const closing = match.startsWith('</');
+      if (tag === 'div' || tag === 'p') return '';
+      if (!RICH_TAGS.has(tag) && !RICH_ALIAS[tag]) return '';
+      if (tag === 'span') {
+        if (closing) return '</span>';
+        const found = /font-size\s*:\s*(\d+)\s*px/i.exec(match);
+        const size = found ? Math.max(10, Math.min(32, Number(found[1]))) : 0;
+        return size ? `<span data-fs="${size}" style="font-size:${size}px">` : '<span>';
+      }
+      const canon = RICH_ALIAS[tag] || tag;
+      return closing ? `</${canon}>` : `<${canon}>`;
+    });
+    // Склеить цепочки переносов по краям и ужать длинные серии.
+    s = s.replace(/^(<br\s*\/?>)+/i, '').replace(/(<br\s*\/?>)+$/i, '');
+    if (s.length > LIMITS.html) s = s.slice(0, LIMITS.html);
+    return s;
+  }
+
+  // Текст без разметки — для проверок пустоты и поиска.
+  function strippedText(html) {
+    return String(html || '')
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .trim();
+  }
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
   // ---------------------------------------------------------------------
@@ -65,25 +129,32 @@
     return value !== null && typeof value === 'object' && !Array.isArray(value);
   }
 
-  // Поиск по заголовку и заметке без учёта регистра.
+  // Поиск по тексту стикера без учёта регистра и разметки.
   function matchesQuery(task, query) {
     const needle = String(query || '').trim().toLocaleLowerCase('ru');
     if (!needle) return true;
-    const haystack = `${task.title}\n${task.note || ''}`.toLocaleLowerCase('ru');
-    return haystack.includes(needle);
+    return strippedText(task.text).toLocaleLowerCase('ru').includes(needle);
+  }
+
+  function firstLine(text) {
+    const line = strippedText(text).split('\n')[0].trim();
+    return line;
   }
 
   function cloneTask(task) {
     return {
       id: task.id,
       columnId: task.columnId,
-      title: task.title,
-      note: task.note,
+      text: task.text,
       tag: task.tag,
       color: task.color,
       dueDate: task.dueDate,
       priority: task.priority,
       order: task.order,
+      // Свободная позиция на доске (px относительно начала .board).
+      // null — задача ещё не раскладывалась свободно, UI разложит стопкой.
+      x: Number.isFinite(task.x) ? task.x : null,
+      y: Number.isFinite(task.y) ? task.y : null,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       deletedAt: task.deletedAt,
@@ -109,13 +180,14 @@
         {
           id,
           columnId,
-          title: '',
-          note: '',
+          text: '',
           tag: null,
           color: null,
           dueDate: null,
           priority: false,
           order,
+          x: null,
+          y: null,
           createdAt: nowIso,
           updatedAt: nowIso,
           deletedAt: null,
@@ -125,36 +197,34 @@
 
     const tasks = [
       task('seed-1', 'pool', 1000, {
-        title: 'Придумать оформление домашней страницы вики',
-        note: 'Проверить, как выглядят карточки-ссылки: тень, отступы, заголовок.',
+        text: 'Придумать оформление домашней страницы вики\nПроверить, как выглядят карточки-ссылки: тень, отступы, заголовок.',
         tag: 'idea',
         color: 'mint',
       }),
       task('seed-2', 'pool', 2000, {
-        title: 'Собрать список книг на осень',
+        text: 'Собрать список книг на осень',
         tag: 'study',
         color: 'blue',
       }),
       task('seed-3', 'urgent', 1000, {
-        title: 'Оплатить продление сервера до пятницы',
-        note: 'Счёт лежит в почте, платёжку подтверждает банк.',
+        text: 'Оплатить продление сервера до пятницы\nСчёт лежит в почте, платёжку подтверждает банк.',
         tag: 'urgent',
         color: 'pink',
         dueDate: localDateString(now + 2 * dayMs),
         priority: true,
       }),
       task('seed-4', 'in-progress', 1000, {
-        title: 'Ревью pull request: модуль экспорта',
+        text: 'Ревью pull request: модуль экспорта',
         tag: 'work',
         color: 'yellow',
       }),
       task('seed-5', 'waiting', 1000, {
-        title: 'Ответ от макетчицы по цветам приложения',
+        text: 'Ответ от макетчицы по цветам приложения',
         tag: 'personal',
         color: 'lilac',
       }),
       task('seed-6', 'done', 1000, {
-        title: 'Настроить автосохранение доски',
+        text: 'Настроить автосохранение доски',
         tag: 'work',
         color: 'mint',
       }),
@@ -163,6 +233,7 @@
     return {
       columns: DEFAULT_COLUMNS.map((column) => Object.assign({}, column)),
       tasks,
+      theme: DEFAULT_THEME,
     };
   }
 
@@ -192,8 +263,8 @@
     if (!id || !/^[A-Za-z0-9_-]+$/.test(id) || seenIds.has(id)) {
       return { task: null, issues: [id ? `duplicate/bad id: ${id}` : 'missing id'] };
     }
-    const title = typeof raw.title === 'string' ? raw.title.trim().slice(0, LIMITS.title) : '';
-    if (!title) return { task: null, issues: [`empty title: ${id}`] };
+    const text = sanitizeRich(typeof raw.text === 'string' ? raw.text : '');
+    if (!strippedText(text)) return { task: null, issues: [`empty text: ${id}`] };
 
     let columnId = typeof raw.columnId === 'string' ? raw.columnId : '';
     if (!columnIds.has(columnId)) {
@@ -204,6 +275,15 @@
     const color = COLORS.includes(raw.color) ? raw.color : null;
     const dueDate = typeof raw.dueDate === 'string' && DATE_RE.test(raw.dueDate) ? raw.dueDate : null;
     const order = Number.isFinite(raw.order) ? raw.order : null;
+    // Свободные координаты: только конечные числа, иначе null (автораскладка).
+    // Ограничиваем разумным диапазоном, чтобы битый файл не уносил стикеры.
+    const finiteOrNull = (value) => {
+      if (!Number.isFinite(value)) return null;
+      if (value < -100000 || value > 100000) return null;
+      return value;
+    };
+    const x = finiteOrNull(raw.x);
+    const y = finiteOrNull(raw.y);
     const createdAt = Number.isFinite(raw.createdAt) ? raw.createdAt : now;
     const updatedAt = Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt;
     const deletedAt = Number.isFinite(raw.deletedAt) ? raw.deletedAt : null;
@@ -212,13 +292,14 @@
       task: {
         id,
         columnId, // может быть null — подставим ниже
-        title,
-        note: typeof raw.note === 'string' ? raw.note.slice(0, LIMITS.note) : '',
+        text,
         tag,
         color,
         dueDate,
         priority: raw.priority === true,
         order,
+        x,
+        y,
         createdAt,
         updatedAt,
         deletedAt,
@@ -279,7 +360,7 @@
       fresh.push(task);
     }
 
-    const board = { columns, tasks: fresh };
+    const board = { columns, tasks: fresh, theme: sanitizeTheme(raw.theme) };
     const repairedNow = normalizeOrders(board);
     return { board, issues, repaired: issues.length > 0 || repairedNow };
   }
@@ -460,6 +541,20 @@
       this._emit({ type: 'change', reason: 'query' });
     }
 
+    // -- тема оформления -------------------------------------------------
+
+    getTheme() {
+      return sanitizeTheme(this._board.theme);
+    }
+
+    setTheme(id) {
+      if (!THEMES.some((entry) => entry.id === id)) return { ok: false, reason: 'bad-theme' };
+      if (this._board.theme === id) return { ok: true, theme: id };
+      this._board.theme = id;
+      this._afterChange('theme');
+      return { ok: true, theme: id };
+    }
+
     // -- задачи ----------------------------------------------------------
 
     _nextId() {
@@ -469,8 +564,8 @@
 
     createTask(input) {
       const fields = input || {};
-      const title = typeof fields.title === 'string' ? fields.title.trim().slice(0, LIMITS.title) : '';
-      if (!title) return { ok: false, reason: 'empty-title' };
+      const text = sanitizeRich(typeof fields.text === 'string' ? fields.text : '');
+      if (!strippedText(text)) return { ok: false, reason: 'empty-text' };
 
       let column = fields.columnId ? this._column(fields.columnId) : null;
       if (!column) column = this._board.columns[0];
@@ -480,17 +575,23 @@
       const now = this._clock();
       const list = this._activeTasks(column.id);
       const first = list.length ? list[0] : null;
+      const freeCoord = (value) => {
+        if (!Number.isFinite(value)) return null;
+        if (value < -100000 || value > 100000) return null;
+        return value;
+      };
       const task = {
         id: this._nextId(),
         columnId: column.id,
-        title,
-        note: typeof fields.note === 'string' ? fields.note.slice(0, LIMITS.note) : '',
+        text,
         tag: TAGS.some((entry) => entry.id === fields.tag) ? fields.tag : null,
         color: COLORS.includes(fields.color) ? fields.color : null,
         dueDate: typeof fields.dueDate === 'string' && DATE_RE.test(fields.dueDate) ? fields.dueDate : null,
         priority: fields.priority === true,
         // Новая задача кладётся наверх колонки — как свежий стикер в стопку.
         order: first ? first.order - 1000 : 1000,
+        x: freeCoord(fields.x),
+        y: freeCoord(fields.y),
         createdAt: now,
         updatedAt: now,
         deletedAt: null,
@@ -506,19 +607,12 @@
       const fields = patch || {};
       const changed = [];
 
-      if ("title" in fields) {
-        const title = typeof fields.title === 'string' ? fields.title.trim().slice(0, LIMITS.title) : '';
-        if (!title) return { ok: false, reason: 'empty-title' };
-        if (title !== task.title) {
-          task.title = title;
-          changed.push('title');
-        }
-      }
-      if ("note" in fields) {
-        const note = typeof fields.note === 'string' ? fields.note.slice(0, LIMITS.note) : '';
-        if (note !== task.note) {
-          task.note = note;
-          changed.push('note');
+      if ("text" in fields) {
+        const text = sanitizeRich(typeof fields.text === 'string' ? fields.text : '');
+        if (!strippedText(text)) return { ok: false, reason: 'empty-text' };
+        if (text !== task.text) {
+          task.text = text;
+          changed.push('text');
         }
       }
       if ("tag" in fields) {
@@ -560,7 +654,9 @@
     /**
      * Перемещение задачи. Позиция задаётся соседями места назначения:
      * вставить после `afterId` и/или перед `beforeId`. Если соседей нет —
-     * задача уходит в конец колонки.
+     * задача уходит в конец колонки. Поля `x`/`y` (свободные координаты)
+     * при наличии сохраняются как визуальная позиция — стикер остаётся
+     * там, где его бросили, даже на границе колонок.
      */
     moveTask(id, targetColumnId, position) {
       const task = this._findTask(id);
@@ -593,8 +689,45 @@
       const movedColumn = task.columnId !== target.id;
       task.columnId = target.id;
       task.order = order;
+      if (Number.isFinite(spot.x) && Number.isFinite(spot.y)) {
+        task.x = Math.max(-100000, Math.min(100000, spot.x));
+        task.y = Math.max(-100000, Math.min(100000, spot.y));
+      }
       task.updatedAt = this._clock();
       this._afterChange(movedColumn ? 'move' : 'reorder', task);
+      return { ok: true, task: cloneTask(task) };
+    }
+
+    /**
+     * Точечное обновление свободной позиции (живое перетаскивание).
+     * WIP-проверка — как в moveTask: смена колонки в переполненную отклоняется.
+     */
+    setTaskPos(id, targetColumnId, x, y, orderSpot) {
+      const task = this._findTask(id);
+      if (!task || task.deletedAt !== null) return { ok: false, reason: 'not-found' };
+      const target = this._column(targetColumnId);
+      if (!target) return { ok: false, reason: 'no-column' };
+      if (target.id !== task.columnId && this._overLimit(target)) {
+        return { ok: false, reason: 'wip', columnId: target.id, limit: target.wipLimit };
+      }
+      const spot = orderSpot || {};
+      const list = this._activeTasks(target.id).filter((entry) => entry.id !== task.id);
+      const index = this._insertIndex(list, spot.afterId || null, spot.beforeId || null);
+      const previous = index > 0 ? list[index - 1] : null;
+      const next = index < list.length ? list[index] : null;
+      let order = task.order;
+      if (!previous && !next) order = 1000;
+      else if (!previous && next) order = next.order - 1000;
+      else if (previous && !next) order = previous.order + 1000;
+      else if (previous && next) order = (previous.order + next.order) / 2;
+      task.columnId = target.id;
+      task.order = order;
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        task.x = Math.max(-100000, Math.min(100000, x));
+        task.y = Math.max(-100000, Math.min(100000, y));
+      }
+      task.updatedAt = this._clock();
+      this._afterChange('move', task);
       return { ok: true, task: cloneTask(task) };
     }
 
@@ -605,6 +738,43 @@
       if (indexAfter >= 0) return indexAfter + 1;
       if (indexBefore >= 0) return indexBefore;
       return list.length;
+    }
+
+    /**
+     * Точечный сдвиг свободной позиции (расталкивание при наложении).
+     * Колонка и порядок не меняются — только визуальные x/y.
+     */
+    setTaskXY(id, x, y) {
+      const task = this._findTask(id);
+      if (!task || task.deletedAt !== null) return { ok: false, reason: 'not-found' };
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, reason: 'bad-pos' };
+      task.x = Math.max(-100000, Math.min(100000, x));
+      task.y = Math.max(-100000, Math.min(100000, y));
+      task.updatedAt = this._clock();
+      this._afterChange('move', task);
+      return { ok: true, task: cloneTask(task) };
+    }
+
+    /**
+     * Перенос в другую колонку без пересчёта порядка (групповое перетаскивание).
+     * WIP-лимит проверяется как обычно.
+     */
+    relocateTask(id, targetColumnId, x, y) {
+      const task = this._findTask(id);
+      if (!task || task.deletedAt !== null) return { ok: false, reason: 'not-found' };
+      const target = this._column(targetColumnId);
+      if (!target) return { ok: false, reason: 'no-column' };
+      if (target.id !== task.columnId && this._overLimit(target)) {
+        return { ok: false, reason: 'wip', columnId: target.id, limit: target.wipLimit };
+      }
+      task.columnId = target.id;
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        task.x = Math.max(-100000, Math.min(100000, x));
+        task.y = Math.max(-100000, Math.min(100000, y));
+      }
+      task.updatedAt = this._clock();
+      this._afterChange('move', task);
+      return { ok: true, task: cloneTask(task) };
     }
 
     deleteTask(id) {
@@ -629,16 +799,22 @@
       if (!source) return { ok: false, reason: 'not-found' };
       const result = this.createTask({
         columnId: source.columnId,
-        title: `${source.title} (копия)`,
-        note: source.note,
+        text: `${source.text} (копия)`,
         tag: source.tag,
         color: source.color,
         dueDate: source.dueDate,
         priority: source.priority,
+        // Копия чуть со сдвигом, чтобы не лежать ровно под оригиналом.
+        x: Number.isFinite(source.x) ? source.x + 18 : null,
+        y: Number.isFinite(source.y) ? source.y + 18 : null,
       });
       if (result.ok) {
         // Копия встаёт сразу за оригиналом.
-        this.moveTask(result.task.id, source.columnId, { afterId: source.id });
+        this.moveTask(result.task.id, source.columnId, {
+          afterId: source.id,
+          x: result.task.x,
+          y: result.task.y,
+        });
       }
       return result;
     }
@@ -768,9 +944,14 @@
     DEFAULT_COLUMNS,
     TAGS,
     COLORS,
+    THEMES,
+    DEFAULT_THEME,
     LIMITS,
     seedBoardData,
     matchesQuery,
+    firstLine,
+    sanitizeRich,
+    strippedText,
     todayString,
     localDateString,
     sanitizeBoard,

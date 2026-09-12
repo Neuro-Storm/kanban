@@ -32,15 +32,15 @@
       </div>
 
       <div class="actions">
-        <button id="addTaskBtn" class="btn btn-primary" type="button">
-          <span class="btn-plus">＋</span> Задача
-        </button>
+        <select id="themeSelect" class="theme-select" title="Тема доски"></select>
+        <button id="bulkDeleteBtn" class="btn btn-ghost-danger" type="button" hidden>Удалить</button>
       </div>
     </header>
 
     <main class="board-wrap">
-      <div class="board" id="board" aria-label="Канбан-доска"></div>
+      <div class="board" id="board" aria-label="Канбан-доска">
       <button id="addColumnBtn" class="add-column" type="button">＋ Колонка</button>
+      </div>
     </main>
 
     <div class="toasts" id="toasts" aria-live="polite"></div>
@@ -59,10 +59,7 @@
           <button class="icon-btn" data-action="column-menu" title="Настройки колонки" type="button">⚙</button>
         </div>
       </header>
-      <div class="sticker-list" data-role="list"></div>
-      <div class="column-foot">
-        <button class="ghost-add" data-action="quick-add" type="button">＋ Добавить стикер</button>
-      </div>
+      <div class="sticker-list" data-role="list" title="Кликни по пустому месту и печатай — новый стикер"></div>
     </section>
   </template>
 
@@ -71,13 +68,11 @@
       <div class="sticker-pin" aria-hidden="true"></div>
       <div class="sticker-body">
         <div class="sticker-badges" data-role="badges"></div>
-        <h3 class="sticker-title" data-role="title"></h3>
-        <p class="sticker-note" data-role="note"></p>
+        <div class="sticker-text" data-role="text"></div>
         <div class="sticker-meta" data-role="meta"></div>
       </div>
       <div class="sticker-actions">
-        <button class="chip-btn" data-action="complete" title="В «Завершено»" type="button">✓</button>
-        <button class="chip-btn" data-action="duplicate" title="Дублировать" type="button">⧉</button>
+        <button class="chip-btn" data-action="edit" title="Редактировать всё (метка, цвет, срок)" type="button">✎</button>
         <button class="chip-btn chip-danger" data-action="delete" title="Удалить" type="button">✕</button>
       </div>
     </article>
@@ -88,12 +83,8 @@
       <div class="editor-sheet">
         <div class="editor-grip" aria-hidden="true"></div>
         <label class="field">
-          <span class="field-label">Заголовок</span>
-          <input id="editTitle" name="title" type="text" maxlength="300" autocomplete="off" spellcheck="false" />
-        </label>
-        <label class="field">
-          <span class="field-label">Заметка</span>
-          <textarea id="editNote" name="note" rows="5" maxlength="4000" placeholder="Детали, мысли, ссылки…"></textarea>
+          <span class="field-label">Текст стикера</span>
+          <div id="editText" class="rich-editor" contenteditable="true" spellcheck="true"></div>
         </label>
         <div class="field-row">
           <div class="field">
@@ -116,7 +107,6 @@
         <div class="editor-buttons">
           <button id="editDelete" class="btn btn-ghost-danger" type="button">Удалить</button>
           <div class="editor-buttons-right">
-            <button id="editDuplicate" class="btn btn-ghost" type="button">Дублировать</button>
             <button id="editSave" class="btn btn-primary" type="button">Готово</button>
           </div>
         </div>

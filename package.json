@@ -1,7 +1,7 @@
 {
   "name": "kanban-desktop",
   "productName": "Канбан",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Канбан-доска как рабочий лист со стикерами: свободное перетаскивание, WIP-лимиты, автосохранение. Без облака, всё локально.",
   "main": "electron/main.js",
   "author": "Neuro-Storm",
