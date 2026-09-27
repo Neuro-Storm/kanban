@@ -28,7 +28,15 @@
     if (window.kanbanAPI && typeof window.kanbanAPI.loadBoard === 'function') {
       return {
         load: () => window.kanbanAPI.loadBoard(),
+        // Асинхронная запись (Electron invoke + очередь в main): не фризит
+        // рендерер на диске. store.flush() умеет и промис, и синхронный ответ.
         save: (payload) => window.kanbanAPI.saveBoard(payload),
+        saveSync: (payload) => {
+          if (window.kanbanAPI && typeof window.kanbanAPI.saveBoardSync === 'function') {
+            return window.kanbanAPI.saveBoardSync(payload);
+          }
+          return window.kanbanAPI.saveBoard(payload);
+        },
       };
     }
     const KEY = 'kanban-board-v1';
@@ -53,6 +61,8 @@
     boardWrap: document.querySelector('.board-wrap'),
     addColumnBtn: document.getElementById('addColumnBtn'),
     bulkDeleteBtn: document.getElementById('bulkDeleteBtn'),
+    exportBtn: document.getElementById('exportBtn'),
+    importBtn: document.getElementById('importBtn'),
     themeSelect: document.getElementById('themeSelect'),
     searchInput: document.getElementById('searchInput'),
     searchBox: document.querySelector('.search'),
@@ -405,6 +415,120 @@
       /* снимок недоступен — используем DOM */
     }
     return { x: Math.max(0, Math.round(origin.x)), y: Math.max(0, Math.round(maxBottom)) };
+  }
+
+  // ---------------------------------------------------------------------
+  // Рефлоу X при изменении геометрии дорожек (ресайз, +/- колонка).
+  // Стикеры хранят абсолютный x относительно .board, а дорожки — flex
+  // (ширина зависит от окна). Без пересчёта стикер остаётся на старом px
+  // и визуально «переезжает» в соседнюю колонку. Привязка — к СВОЕЙ
+  // колонке по task.columnId: центр-снапнутые встают в новый центр,
+  // остальные едут пропорционально внутри своей дорожки (см.
+  // Core.computeReflowX). Y не трогается — дорожки stretch по вертикали.
+  // Запись тихая: один батч store.updatePositionsBatch, без тостов.
+  // ---------------------------------------------------------------------
+
+  let lastGeom = null;
+
+  function currentGeom() {
+    const boardRect = dom.board.getBoundingClientRect();
+    return { boardWidth: boardRect.width, lanes: measureLanes() };
+  }
+
+  function snapshotGeom() {
+    lastGeom = currentGeom();
+    return lastGeom;
+  }
+
+  // Плавность рефлоу: вешаем .reflow на сдвинутые узлы, снимаем пачкой
+  // по таймауту (дольше перехода). Перетаскиваемый узел не трогаем —
+  // ему переход противопоказан, он идёт за курсором.
+  let reflowTimer = null;
+  function markReflowed(node) {
+    if (!node || node === drag.node) return;
+    node.classList.add('reflow');
+    if (reflowTimer) clearTimeout(reflowTimer);
+    reflowTimer = setTimeout(() => {
+      reflowTimer = null;
+      for (const stale of dom.board.querySelectorAll(':scope > .sticker.reflow')) {
+        stale.classList.remove('reflow');
+      }
+    }, 450);
+  }
+
+  function reflowBoardPositions(oldGeom, newGeom) {
+    if (!oldGeom || !newGeom || !oldGeom.lanes.length || !newGeom.lanes.length) return 0;
+    const oldById = new Map(oldGeom.lanes.map((lane) => [lane.id, lane]));
+    const newById = new Map(newGeom.lanes.map((lane) => [lane.id, lane]));
+    let snapshot = null;
+    try {
+      snapshot = store.snapshot();
+    } catch (error) {
+      return 0;
+    }
+    const items = [];
+    for (const task of snapshot.tasks) {
+      if (task.deletedAt !== null) continue;
+      if (!Number.isFinite(task.x)) continue;
+      const oldLane = oldById.get(task.columnId) || null;
+      const newLane = newById.get(task.columnId) || null;
+      if (!newLane) continue; // колонки больше нет — путь removeColumn
+      const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
+      const width = node ? node.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
+      const nextX = Core.computeReflowX({
+        x: task.x,
+        width,
+        oldLane,
+        newLane,
+        oldBoardWidth: oldGeom.boardWidth,
+        newBoardWidth: newGeom.boardWidth,
+        centerTol: SNAP_CENTER_PX + 2,
+      });
+      if (nextX !== null && nextX !== task.x) {
+        items.push({ id: task.id, x: nextX });
+        if (node) {
+          node.style.left = `${nextX}px`;
+          markReflowed(node);
+        }
+      }
+    }
+    if (items.length) store.updatePositionsBatch(items);
+    return items.length;
+  }
+
+  // Стартовый ремонт: файл могли сохранить в узком окне, а открыть в
+  // широком (и наоборот) — старая геометрия неизвестна. Безопасный минимум:
+  // стикеры, стоявшие по центру своей дорожки (± допуск), дотянуть до
+  // актуального центра; остальные не трогать.
+  function repairCenteredStickers() {
+    const geom = currentGeom();
+    if (!geom.lanes.length) return 0;
+    const byId = new Map(geom.lanes.map((lane) => [lane.id, lane]));
+    let snapshot = null;
+    try {
+      snapshot = store.snapshot();
+    } catch (error) {
+      return 0;
+    }
+    const items = [];
+    for (const task of snapshot.tasks) {
+      if (task.deletedAt !== null) continue;
+      if (!Number.isFinite(task.x)) continue;
+      const lane = byId.get(task.columnId);
+      if (!lane) continue;
+      const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
+      const width = node ? node.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
+      const centerX = (lane.left + lane.right) / 2 - width / 2;
+      if (Math.abs(task.x - centerX) <= SNAP_CENTER_PX + 2 && task.x !== Math.round(centerX)) {
+        items.push({ id: task.id, x: Math.round(centerX) });
+        if (node) {
+          node.style.left = `${Math.round(centerX)}px`;
+          markReflowed(node);
+        }
+      }
+    }
+    if (items.length) store.updatePositionsBatch(items);
+    return items.length;
   }
 
   // ---------------------------------------------------------------------
@@ -1293,7 +1417,8 @@
     if (event.button === 1) event.preventDefault();
   });
 
-  // Окно потянули — пол пересчитываем, глубина под контент остаётся.
+  // Окно потянули — X стикеров едут за своими дорожками (рефлоу),
+  // глубина под контент остаётся.
   let resizeTimer = null;
   window.addEventListener('resize', () => {
     if (resizeTimer) clearTimeout(resizeTimer);
@@ -1301,7 +1426,19 @@
       resizeTimer = null;
       fitBoardToContent._last = 0;
       fitBoardToContent();
+      const newGeom = currentGeom();
+      if (lastGeom) reflowBoardPositions(lastGeom, newGeom);
+      snapshotGeom();
     }, 150);
+  });
+
+  // Не успели записать — пробуем блокирующе при выгрузке.
+  window.addEventListener('beforeunload', () => {
+    try {
+      store.flushSync();
+    } catch (error) {
+      /* выгрузка — лучше молча, чем с исключением */
+    }
   });
 
   // ---------------------------------------------------------------------
@@ -2012,10 +2149,22 @@
     const removeBtn = element('button', 'btn btn-ghost-danger', 'Удалить колонку');
     removeBtn.style.marginTop = '2px';
     removeBtn.addEventListener('click', () => {
-      const result = store.removeColumn(columnId);
+      // Стикеры остаются на месте: владельца среди оставшихся дорожек
+      // считаем по текущему центру стикера (геометрия до удаления).
+      const lanesBefore = measureLanes().filter((lane) => lane.id !== columnId);
+      const fallbackId = lanesBefore.length ? store.snapshot().columns.find((column) => column.id !== columnId && lanesBefore.some((lane) => lane.id === column.id))?.id || lanesBefore[0].id : null;
+      const reassign = (task) => {
+        if (!lanesBefore.length) return fallbackId;
+        const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
+        const width = node ? node.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
+        const centerX = Number.isFinite(task.x) ? task.x + width / 2 : null;
+        if (centerX === null) return fallbackId;
+        return columnIdAtBoardX(centerX, lanesBefore) || fallbackId;
+      };
+      const oldGeom = lastGeom && lastGeom.lanes.length ? lastGeom : currentGeom();
+      const result = store.removeColumn(columnId, reassign);
       if (!result.ok) {
         const messages = {
-          'not-empty': 'Сначала перенеси или удали стикеры из колонки',
           'last-column': 'Последнюю колонку удалить нельзя',
         };
         toast(messages[result.reason] || 'Не получилось удалить колонку', null);
@@ -2024,6 +2173,11 @@
       }
       closeConfirmPop();
       render();
+      reflowBoardPositions(oldGeom, currentGeom());
+      snapshotGeom();
+      if (result.moved > 0) {
+        toast(`Колонка удалена — ${result.moved} шт. остались на месте`, null);
+      }
     });
     pop.appendChild(removeBtn);
 
@@ -2052,9 +2206,12 @@
   dom.addColumnBtn.addEventListener('click', () => {
     const snapshot = store.snapshot();
     const suggested = `Колонка ${snapshot.columns.length + 1}`;
+    const oldGeom = lastGeom && lastGeom.lanes.length ? lastGeom : currentGeom();
     const result = store.addColumn(suggested);
     if (result.ok) {
       render();
+      reflowBoardPositions(oldGeom, currentGeom());
+      snapshotGeom();
       toast('Колонка добавлена — переименуй её кликом по заголовку', null);
     }
   });
@@ -2210,13 +2367,76 @@
     if (!result.ok) applyTheme(); // успех сам придёт через subscribe → render
   });
 
+  // Экспорт/импорт доски через диалог файла (мост kanbanAPI).
+  // В браузере без Electron кнопок нет смысла — прячем их.
+  if (!window.kanbanAPI || typeof window.kanbanAPI.exportBoard !== 'function') {
+    if (dom.exportBtn) dom.exportBtn.hidden = true;
+    if (dom.importBtn) dom.importBtn.hidden = true;
+  } else {
+    if (dom.exportBtn) {
+      dom.exportBtn.addEventListener('click', async () => {
+        try {
+          const result = await window.kanbanAPI.exportBoard();
+          if (result && result.ok) toast('Копия доски сохранена', null);
+          else if (result && result.reason !== 'cancelled') {
+            toast(`Не удалось экспортировать: ${result.error || 'ошибка'}`, null);
+          }
+        } catch (error) {
+          toast(`Не удалось экспортировать: ${error.message || error}`, null);
+        }
+      });
+    }
+    if (dom.importBtn) {
+      dom.importBtn.addEventListener('click', async () => {
+        try {
+          const result = await window.kanbanAPI.importBoard();
+          if (!result || !result.ok) {
+            if (result && result.reason !== 'cancelled') {
+              toast(`Не удалось импортировать: ${result.error || 'ошибка'}`, null);
+            }
+            return;
+          }
+          const replaced = store.replaceAll(result.payload);
+          if (!replaced.ok) {
+            toast('Файл не похож на доску — импорт отклонён', null);
+            return;
+          }
+          selectedIds.clear();
+          render();
+          repairCenteredStickers();
+          render();
+          snapshotGeom();
+          toast('Доска загружена из файла', null);
+        } catch (error) {
+          toast(`Не удалось импортировать: ${error.message || error}`, null);
+        }
+      });
+    }
+  }
+
   // ---------------------------------------------------------------------
   // Старт и смоук-тест
   // ---------------------------------------------------------------------
 
   function startup() {
     render();
+    // Геометрия могла отличаться от той, где файл сохраняли:
+    // центр-снапнутые дотягиваем до актуального центра, остальные не трогаем.
+    repairCenteredStickers();
+    render();
+    snapshotGeom();
     refreshSaveStatus();
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => {
+        try {
+          repairCenteredStickers();
+          render();
+          snapshotGeom();
+        } catch (error) {
+          /* шрифты не помешали старту */
+        }
+      });
+    }
   }
 
   if (SMOKE) {
@@ -2306,7 +2526,8 @@
       check('restore: ok', restored.ok);
 
       // Автосохранение: ждём flush и сверяем с загруженным.
-      store.flush();
+      // Детерминированно — через блокирующий flushSync.
+      store.flushSync();
       const raw = window.kanbanAPI ? window.kanbanAPI.loadBoard() : null;
       if (raw) {
         check('persist: доска записана', Array.isArray(raw.board.tasks) && raw.board.tasks.length > 0);
@@ -2323,9 +2544,94 @@
       const removed = store.removeColumn(added.column.id);
       check('column: удалена', removed.ok);
 
-      // Защита от удаления непустой колонки
-      const noRemove = store.removeColumn('in-progress');
-      check('column: непустая не удаляется', noRemove.ok === false && noRemove.reason === 'not-empty');
+      // Удаление непустой колонки: стикеры остаются на месте (x/y те же),
+      // владелец переназначается, данные не теряются.
+      const keeperCol = store.addColumn('Хранитель');
+      check('column: хранитель добавлен', keeperCol.ok);
+      const keeperTask = store.createTask({ columnId: keeperCol.column.id, text: 'Не теряюсь', x: 40, y: 50 });
+      check('column: стикер в удаляемой создан', keeperTask.ok);
+      const beforeXY = keeperTask.ok ? { x: keeperTask.task.x, y: keeperTask.task.y } : null;
+      const keeperRemoved = store.removeColumn(keeperCol.column.id, () => 'pool');
+      check('column: непустая удаляется без потерь', keeperRemoved.ok && keeperRemoved.moved === 1,
+        JSON.stringify(keeperRemoved));
+      const kept = keeperTask.ok ? store.getTask(keeperTask.task.id) : null;
+      check('column: стикер жив после удаления колонки', Boolean(kept));
+      check('column: стикер остался на месте',
+        Boolean(kept) && kept.x === beforeXY.x && kept.y === beforeXY.y,
+        kept ? `${kept.x},${kept.y}` : 'нет задачи');
+      check('column: стикер переназначен в пул', Boolean(kept) && kept.columnId === 'pool',
+        kept ? kept.columnId : 'нет задачи');
+
+      // Рефлоу X: чистая функция привязки к своей дорожке.
+      const oldLane = { left: 100, right: 300 };
+      const newLane = { left: 200, right: 600 };
+      check('reflow: центр едет в новый центр',
+        Core.computeReflowX({ x: 100, width: 200, oldLane, newLane }) === 300);
+      check('reflow: край едет пропорционально внутри дорожки',
+        Core.computeReflowX({ x: 270, width: 200, oldLane, newLane }) === 540);
+      check('reflow: без дорожек — доля борда',
+        Core.computeReflowX({ x: 50, width: 200, oldBoardWidth: 1000, newBoardWidth: 2000 }) === 100);
+
+      // Живой рефлоу narrow→wide: точный сценарий «растянули окно во весь экран».
+      // Уводим задачи в суженную геометрию, затем идём штатным путём ресайза
+      // обратно и проверяем инвариант: центр каждого стикера — в своей колонке.
+      render();
+      const wideGeom = currentGeom();
+      const narrowGeom = {
+        boardWidth: Math.round(wideGeom.boardWidth * 0.6),
+        lanes: wideGeom.lanes.map((lane) => ({
+          id: lane.id,
+          left: Math.round(lane.left * 0.6),
+          right: Math.round(lane.left * 0.6 + (lane.right - lane.left) * 0.6),
+        })),
+      };
+      const wideX = new Map();
+      for (const task of store.snapshot().tasks) {
+        if (task.deletedAt === null && Number.isFinite(task.x)) wideX.set(task.id, task.x);
+      }
+      const toNarrow = [];
+      for (const [id, x] of wideX) {
+        const task = store.getTask(id);
+        const lane = wideGeom.lanes.find((entry) => entry.id === task.columnId);
+        const narrowLane = narrowGeom.lanes.find((entry) => entry.id === task.columnId);
+        if (!lane || !narrowLane) continue;
+        const target = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
+        const w = target ? target.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
+        const nx = Core.computeReflowX({
+          x, width: w, oldLane: lane, newLane: narrowLane,
+          oldBoardWidth: wideGeom.boardWidth, newBoardWidth: narrowGeom.boardWidth,
+          centerTol: SNAP_CENTER_PX + 2,
+        });
+        if (nx !== null) toNarrow.push({ id, x: nx });
+      }
+      store.updatePositionsBatch(toNarrow);
+      render();
+      reflowBoardPositions(narrowGeom, currentGeom());
+      render();
+      let misplaced = 0;
+      let drifted = 0;
+      for (const [id, x] of wideX) {
+        const after = store.getTask(id);
+        if (!after) {
+          drifted += 1;
+          continue;
+        }
+        const ownLane = wideGeom.lanes.find((entry) => entry.id === after.columnId);
+        const ownCenter = ownLane ? Math.round((ownLane.left + ownLane.right) / 2 - STICKER_WIDTH / 2) : null;
+        // Допустимо: вернулся в исходный x (±1 округление) либо легитимно
+        // дощёлкнулся в центр своей дорожки (центр-магнит рефлоу).
+        if (Math.abs(after.x - x) > 1 && (ownCenter === null || Math.abs(after.x - ownCenter) > 2)) {
+          drifted += 1;
+        }
+        const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
+        if (node) {
+          const left = Number.parseFloat(node.style.left || '0') || 0;
+          const center = left + (node.offsetWidth || STICKER_WIDTH) / 2;
+          if (columnIdAtBoardX(center) !== after.columnId) misplaced += 1;
+        }
+      }
+      check('reflow: narrow→wide — x на месте или в центре своей дорожки', drifted === 0, `уплыло: ${drifted}`);
+      check('reflow: narrow→wide — все стикеры в своих дорожках', misplaced === 0, `мимо: ${misplaced}`);
 
       // Живое перетаскивание: живой узел движется сам, без призрака и слота.
       // Стикер можно бросить на границе — он остаётся где бросили.
@@ -2660,6 +2966,24 @@
           check('multiline: переносы на доске',
             Boolean(mlShown) && mlShown.textContent.includes('первая') && mlShown.textContent.includes('третья'),
             mlShown ? JSON.stringify(mlShown.textContent.slice(0, 40)) : 'нет узла');
+          // Без лимита высоты: длинный текст не режется клампом.
+          const longTask = store.createTask({
+            columnId: 'pool',
+            text: Array.from({ length: 20 }, (_, i) => `строка ${i + 1}`).join('<br>'),
+          });
+          check('fulltext: длинный стикер создан', longTask.ok);
+          render();
+          const longText = longTask.ok
+            ? dom.board.querySelector(
+              `:scope > .sticker[data-task-id="${longTask.task.id}"] [data-role="text"]`
+            )
+            : null;
+          const longClamp = longText ? window.getComputedStyle(longText)['-webkit-line-clamp'] : '?';
+          check('fulltext: кламп снят, виден весь текст',
+            Boolean(longText) &&
+            (longClamp === 'none' || longClamp === 'unset' || longClamp === '') &&
+            longText.scrollHeight <= longText.clientHeight + 2,
+            String(longClamp));
         }
       } else {
         check('multiline: узел найден', false);
@@ -2711,6 +3035,14 @@
       check('depth: доска подогнана под контент',
         dom.board.style.minHeight.endsWith('px') && Number.parseFloat(dom.board.style.minHeight) > 0,
         dom.board.style.minHeight);
+
+      // Кнопка «+ Колонка»: приклеена к верху, высотой с окно.
+      const addColStyle = window.getComputedStyle(dom.addColumnBtn);
+      const addColH = dom.addColumnBtn.getBoundingClientRect().height;
+      check('addcol: кнопка высотой с окно',
+        addColStyle.position === 'sticky' &&
+        Math.abs(addColH - (window.innerHeight - 96)) < 60,
+        `${addColStyle.position}/${Math.round(addColH)} vs ${window.innerHeight - 96}`);
 
       // Темы: селект переключает оформление, тема хранится в доске.
       const styleOf = () => window.getComputedStyle(document.body);

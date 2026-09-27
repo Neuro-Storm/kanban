@@ -388,6 +388,51 @@
   }
 
   // ---------------------------------------------------------------------
+  // Рефлоу X при изменении геометрии дорожек (ресайз окна, +/- колонка).
+  // Чистая функция: старый абсолютный x пересчитывается относительно
+  // СВОЕЙ дорожки (по columnId, не по центру — иначе съезжает в соседа).
+  //  - центр-снапнутые (|x − oldCenter| <= centerTol) встают в новый центр;
+  //  - остальные едут пропорционально внутри своей дорожки;
+  //  - без дорожек — долей ширины борда; итог клампится в [0, maxX].
+  // ---------------------------------------------------------------------
+
+  function computeReflowX(input) {
+    const opts = input || {};
+    const x = Number(opts.x);
+    const width = Number.isFinite(opts.width) && opts.width > 0 ? opts.width : 200;
+    const centerTol = Number.isFinite(opts.centerTol) ? opts.centerTol : 50;
+    const oldLane = opts.oldLane || null;
+    const newLane = opts.newLane || null;
+    const oldBoardWidth =
+      Number.isFinite(opts.oldBoardWidth) && opts.oldBoardWidth > 0 ? opts.oldBoardWidth : 0;
+    const newBoardWidth =
+      Number.isFinite(opts.newBoardWidth) && opts.newBoardWidth > 0 ? opts.newBoardWidth : 0;
+    const clamp01 = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+
+    if (!Number.isFinite(x)) return null;
+    const maxX = newBoardWidth > 0 ? Math.max(0, newBoardWidth - width) : Infinity;
+
+    if (oldLane && newLane) {
+      const oldWidth = oldLane.right - oldLane.left;
+      const newWidth = newLane.right - newLane.left;
+      const oldCenter = (oldLane.left + oldLane.right) / 2 - width / 2;
+      if (Math.abs(x - oldCenter) <= centerTol) {
+        return clamp01(Math.round((newLane.left + newLane.right) / 2 - width / 2), 0, maxX);
+      }
+      if (oldWidth > 0 && newWidth > 0) {
+        const ratio = (x - oldLane.left) / oldWidth;
+        return clamp01(Math.round(newLane.left + ratio * newWidth), 0, maxX);
+      }
+      const newCenter = Math.round((newLane.left + newLane.right) / 2 - width / 2);
+      return clamp01(newCenter, 0, maxX);
+    }
+    if (oldBoardWidth > 0 && newBoardWidth > 0) {
+      return clamp01(Math.round((x / oldBoardWidth) * newBoardWidth), 0, maxX);
+    }
+    return clamp01(Math.round(x), 0, maxX === Infinity ? Math.round(x) : maxX);
+  }
+
+  // ---------------------------------------------------------------------
   // Основной класс
   // ---------------------------------------------------------------------
 
@@ -675,16 +720,7 @@
 
       let previous = index > 0 ? list[index - 1] : null;
       let next = index < list.length ? list[index] : null;
-      if (previous && next && next.order - previous.order < 2) {
-        normalizeOrders(this._board);
-        previous = index > 0 ? list[index - 1] : null;
-        next = index < list.length ? list[index] : null;
-      }
-      let order;
-      if (!previous && !next) order = 1000;
-      else if (!previous) order = next.order - 1000;
-      else if (!next) order = previous.order + 1000;
-      else order = (previous.order + next.order) / 2;
+      const order = this._orderForIndex(list, index, previous, next);
 
       const movedColumn = task.columnId !== target.id;
       task.columnId = target.id;
@@ -713,13 +749,8 @@
       const spot = orderSpot || {};
       const list = this._activeTasks(target.id).filter((entry) => entry.id !== task.id);
       const index = this._insertIndex(list, spot.afterId || null, spot.beforeId || null);
-      const previous = index > 0 ? list[index - 1] : null;
-      const next = index < list.length ? list[index] : null;
-      let order = task.order;
-      if (!previous && !next) order = 1000;
-      else if (!previous && next) order = next.order - 1000;
-      else if (previous && !next) order = previous.order + 1000;
-      else if (previous && next) order = (previous.order + next.order) / 2;
+      const order = this._orderForIndex(list, index, index > 0 ? list[index - 1] : null,
+        index < list.length ? list[index] : null);
       task.columnId = target.id;
       task.order = order;
       if (Number.isFinite(x) && Number.isFinite(y)) {
@@ -740,6 +771,24 @@
       return list.length;
     }
 
+    // Общий расчёт order для вставки в позицию index списка list
+    // (без перемещаемой задачи). При сближении соседей (< 2) доска
+    // нормализуется — единый путь для moveTask и setTaskPos, иначе
+    // живое перетаскивание вырождает дробный порядок в щели.
+    _orderForIndex(list, index, previous, next) {
+      let prev = previous !== undefined ? previous : index > 0 ? list[index - 1] : null;
+      let nxt = next !== undefined ? next : index < list.length ? list[index] : null;
+      if (prev && nxt && nxt.order - prev.order < 2) {
+        normalizeOrders(this._board);
+        prev = index > 0 ? list[index - 1] : null;
+        nxt = index < list.length ? list[index] : null;
+      }
+      if (!prev && !nxt) return 1000;
+      if (!prev) return nxt.order - 1000;
+      if (!nxt) return prev.order + 1000;
+      return (prev.order + nxt.order) / 2;
+    }
+
     /**
      * Точечный сдвиг свободной позиции (расталкивание при наложении).
      * Колонка и порядок не меняются — только визуальные x/y.
@@ -753,6 +802,35 @@
       task.updatedAt = this._clock();
       this._afterChange('move', task);
       return { ok: true, task: cloneTask(task) };
+    }
+
+    /**
+     * Пакетное обновление свободных X-позиций (рефлоу при ресайзе).
+     * Тихий путь: одна запись на диск и одно событие, без спама рендеров.
+     * WIP/порядок не трогаются — только визуальный x. Возвращает число
+     * реально изменённых задач.
+     */
+    updatePositionsBatch(items) {
+      const list = Array.isArray(items) ? items : [];
+      if (!list.length) return { ok: true, updated: 0, skipped: true };
+      const now = this._clock();
+      let updated = 0;
+      for (const entry of list) {
+        if (!entry || typeof entry.id !== 'string') continue;
+        const task = this._findTask(entry.id);
+        if (!task || task.deletedAt !== null) continue;
+        if (!Number.isFinite(entry.x)) continue;
+        const nextX = Math.max(-100000, Math.min(100000, Math.round(entry.x)));
+        if (task.x === nextX) continue;
+        task.x = nextX;
+        task.updatedAt = now;
+        updated += 1;
+      }
+      if (!updated) return { ok: true, updated: 0, skipped: true };
+      this._dirty = true;
+      this._scheduleSave(0);
+      this._emit({ type: 'change', reason: 'reflow' });
+      return { ok: true, updated };
     }
 
     /**
@@ -865,16 +943,46 @@
       return { ok: true, column: Object.assign({}, column) };
     }
 
-    removeColumn(id) {
+    /**
+     * Удаление колонки. Стикеры остаются на месте: x/y не меняются,
+     * задачам переназначается columnId через reassign(task) — UI отдаёт
+     * владельца по центру стикера среди оставшихся дорожек. Без reassign
+     * задачи уходят в первую оставшуюся колонку. WIP при системном
+     * переназначении не блокирует (подсветка over-limit покажет переполнение),
+     * порядок — в конец новой колонки. Архив (deletedAt) сохраняется.
+     */
+    removeColumn(id, reassign) {
       const column = this._column(id);
       if (!column) return { ok: false, reason: 'not-found' };
       if (this._board.columns.length <= 1) return { ok: false, reason: 'last-column' };
-      if (this._activeTasks(id).length > 0) return { ok: false, reason: 'not-empty' };
-      // Архив удалённых задач колонки уходит вместе с ней.
-      this._board.tasks = this._board.tasks.filter((task) => task.columnId !== id);
-      this._board.columns = this._board.columns.filter((entry) => entry.id !== id);
+      const rest = this._board.columns.filter((entry) => entry.id !== id);
+      const fallbackId = rest.length ? rest[0].id : null;
+      const resolve = typeof reassign === 'function' ? reassign : () => fallbackId;
+      const now = this._clock();
+      let moved = 0;
+      for (const task of this._board.tasks) {
+        if (task.columnId !== id) continue;
+        let targetId = null;
+        try {
+          targetId = resolve(cloneTask(task));
+        } catch (error) {
+          targetId = null;
+        }
+        if (!rest.some((entry) => entry.id === targetId)) targetId = fallbackId;
+        if (!targetId) continue;
+        task.columnId = targetId;
+        task.updatedAt = now;
+        // В конец новой колонки, сохраняя относительный порядок переехавших.
+        const peers = this._board.tasks
+          .filter((entry) => entry.columnId === targetId && entry.id !== task.id && entry.deletedAt === null)
+          .sort(compareByOrder);
+        task.order = peers.length ? peers[peers.length - 1].order + 1000 : 1000;
+        moved += 1;
+      }
+      this._board.columns = rest;
+      normalizeOrders(this._board);
       this._afterChange('column-remove', null, column);
-      return { ok: true };
+      return { ok: true, moved };
     }
 
     // -- персистентность --------------------------------------------------
@@ -907,8 +1015,70 @@
         return { ok: true, savedAt: this._lastSavedAt, skipped: true };
       }
       const payload = { version: SCHEMA_VERSION, savedAt: this._clock(), board: this.snapshot() };
+      let result;
       try {
-        this._storage.save(payload);
+        result = this._storage.save(payload);
+      } catch (error) {
+        this._saveError = error.message || String(error);
+        this._emit({ type: 'save-error', error: this._saveError });
+        return { ok: false, error: this._saveError };
+      }
+      // Асинхронное хранилище (Electron invoke): сохраняем оптимистично,
+      // статус подтянется событием 'saved' по резолву. invoke отдаёт
+      // {ok:false} резолвом, а не броском — проверяем флаг явно.
+      if (result && typeof result.then === 'function') {
+        return result.then(
+          (response) => {
+            if (response && response.ok === false) {
+              this._saveError = response.error || 'запись не удалась';
+              this._emit({ type: 'save-error', error: this._saveError });
+              return { ok: false, error: this._saveError };
+            }
+            this._dirty = false;
+            this._lastSavedAt = payload.savedAt;
+            this._saveError = null;
+            this._emit({ type: 'saved', savedAt: payload.savedAt });
+            return { ok: true, savedAt: payload.savedAt };
+          },
+          (error) => {
+            this._saveError = (error && error.message) || String(error);
+            this._emit({ type: 'save-error', error: this._saveError });
+            return { ok: false, error: this._saveError };
+          }
+        );
+      }
+      this._dirty = false;
+      this._lastSavedAt = payload.savedAt;
+      this._saveError = null;
+      this._emit({ type: 'saved', savedAt: payload.savedAt });
+      return { ok: true, savedAt: payload.savedAt };
+    }
+
+    /**
+     * Блокирующая запись для сценария выгрузки (beforeunload).
+     * Использует storage.saveSync при наличии, иначе синхронный save.
+     * Промисные хранилища здесь не ждут — выгрузка не может ждать invoke.
+     */
+    flushSync() {
+      if (this._saveTimer) {
+        clearTimeout(this._saveTimer);
+        this._saveTimer = null;
+      }
+      if (!this._dirty) return { ok: true, savedAt: this._lastSavedAt, skipped: true };
+      if (!this._storage) {
+        this._dirty = false;
+        return { ok: true, savedAt: this._lastSavedAt, skipped: true };
+      }
+      const payload = { version: SCHEMA_VERSION, savedAt: this._clock(), board: this.snapshot() };
+      try {
+        if (typeof this._storage.saveSync === 'function') {
+          this._storage.saveSync(payload);
+        } else {
+          const result = this._storage.save(payload);
+          if (result && typeof result.then === 'function') {
+            return { ok: false, error: 'async-pending', asyncPending: true };
+          }
+        }
         this._dirty = false;
         this._lastSavedAt = payload.savedAt;
         this._saveError = null;
@@ -956,6 +1126,7 @@
     localDateString,
     sanitizeBoard,
     normalizeOrders,
+    computeReflowX,
     KanbanStore,
   };
 });

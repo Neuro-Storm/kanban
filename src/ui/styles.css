@@ -442,6 +442,14 @@ body::before {
 /* Возврат при отклонённом броске (WIP): плавное скольжение назад. */
 .sticker.returning { transition: left 220ms var(--ease-out), top 220ms var(--ease-out); }
 
+/* Рефлоу при масштабировании окна: стикеры плавно едут за своими дорожками.
+   Класс вешается точечно из JS и снимается по таймауту — живое перетаскивание
+   не затрагивается (там позиции идут за курсором без переходов). */
+.board > .sticker.reflow {
+  transition: left 380ms var(--ease-out), top 380ms var(--ease-out),
+    box-shadow var(--speed-med) var(--ease-out), opacity var(--speed-med) var(--ease-out);
+}
+
 /* Рамка протяжного выделения. */
 .marquee {
   position: absolute;
@@ -630,10 +638,7 @@ body::before {
   color: #2f2b23;
   word-break: break-word;
   white-space: pre-line;
-  display: -webkit-box;
-  -webkit-line-clamp: 8;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  /* Без лимита высоты: виден весь текст, стикер растёт вниз. */
 }
 
 .sticker-meta {
@@ -729,10 +734,20 @@ body::before {
 .sticker[data-color='blue']   { background: linear-gradient(178deg, #c9ddf2 0%, #b9d2ec 100%); }
 .sticker[data-color='lilac']  { background: linear-gradient(178deg, #ddd1f0 0%, #d0c1e8 100%); }
 
-/* --- Кнопка «колонка» ------------------------------------------------------ */
+/* --- Кнопка «колонка» ------------------------------------------------------
+   Вертикальная полоса высотой с окно: приклеена к верху и остаётся видимой
+   при прокрутке длинных колонок. Фиксированная высота (а не stretch за доской),
+   поэтому текст не уезжает вниз. */
 .add-column {
-  align-self: stretch;
+  align-self: flex-start;
+  position: sticky;
+  top: 12px;
   flex: 0 0 46px;
+  height: calc(100vh - 96px);
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: var(--radius-lane);
   border: 1.5px dashed rgba(87, 77, 56, 0.28);
   background: rgba(255, 253, 247, 0.25);

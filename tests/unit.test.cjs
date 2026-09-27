@@ -283,11 +283,19 @@ test('колонки: добавление, переименование, лим
   assert.equal(store.removeColumn(added.column.id).ok, true);
 });
 
-test('колонки: непустую и последнюю удалить нельзя', () => {
+test('колонки: непустая удаляется без потерь, последняя — запрет', () => {
   const { store } = makeStore();
-  const notEmpty = store.removeColumn('pool');
-  assert.equal(notEmpty.ok, false);
-  assert.equal(notEmpty.reason, 'not-empty');
+  const before = store.snapshot().tasks.filter((task) => task.columnId === 'pool');
+  assert.ok(before.length > 0, 'в пуле есть задачи');
+  const removed = store.removeColumn('pool');
+  assert.equal(removed.ok, true);
+  assert.equal(removed.moved, before.length);
+  for (const task of before) {
+    const kept = store.getTask(task.id);
+    assert.ok(kept, `задача ${task.id} жива`);
+    assert.equal(kept.x, task.x, 'x на месте');
+    assert.equal(kept.y, task.y, 'y на месте');
+  }
   const single = new Core.KanbanStore({ storage: memoryStorage() });
   single.init();
   single.replaceAll({ columns: [{ id: 'only', title: 'Единственная' }], tasks: [] });
@@ -425,4 +433,175 @@ test('нормализация порядков сохраняет взаимн�
   const byId = Object.fromEntries(board.tasks.map((task) => [task.id, task]));
   assert.ok(byId.z.order < byId.x.order);
   assert.ok(byId.x.order < byId.y.order);
+});
+
+test('setTaskPos: 40 вставок в одну щель не вырождают порядок', () => {
+  const { store } = makeStore();
+  const first = store.createTask({ columnId: 'pool', text: 'Первый' });
+  const second = store.createTask({ columnId: 'pool', text: 'Второй' });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  // second создан позже — он наверху; вставляем пачку между ними через setTaskPos.
+  for (let i = 0; i < 40; i += 1) {
+    const created = store.createTask({ columnId: 'pool', text: `Щель ${i}` });
+    assert.equal(created.ok, true);
+    const moved = store.setTaskPos(created.task.id, 'pool', 10, 10 + i, {
+      afterId: second.task.id,
+      beforeId: first.task.id,
+    });
+    assert.equal(moved.ok, true);
+  }
+  const orders = store.view().columns.find((column) => column.id === 'pool').tasks.map((task) => task.order);
+  const distinct = new Set(orders);
+  assert.equal(distinct.size, orders.length, 'порядки различимы');
+  const sorted = [...orders].sort((a, b) => a - b);
+  for (let i = 1; i < sorted.length; i += 1) {
+    assert.ok(sorted[i] - sorted[i - 1] > 0, 'строгий порядок сохраняется');
+  }
+});
+
+test('computeReflowX: центр едет в новый центр', () => {
+  const next = Core.computeReflowX({
+    x: 100,
+    width: 200,
+    oldLane: { left: 100, right: 300 },
+    newLane: { left: 200, right: 600 },
+  });
+  assert.equal(next, 300);
+});
+
+test('computeReflowX: край едет пропорционально внутри своей дорожки', () => {
+  const next = Core.computeReflowX({
+    x: 270,
+    width: 200,
+    oldLane: { left: 100, right: 300 },
+    newLane: { left: 200, right: 600 },
+  });
+  assert.equal(next, 540);
+});
+
+test('computeReflowX: без дорожек — доля ширины борда, с клампом', () => {
+  assert.equal(
+    Core.computeReflowX({ x: 50, width: 200, oldBoardWidth: 1000, newBoardWidth: 2000 }),
+    100
+  );
+  const clamped = Core.computeReflowX({ x: 990, width: 200, oldBoardWidth: 1000, newBoardWidth: 2000 });
+  assert.equal(clamped, 1800, 'не уезжает за правый край');
+  assert.equal(Core.computeReflowX({ x: NaN, width: 200 }), null);
+});
+
+test('removeColumn: непустая удаляется, стикеры остаются на месте', () => {
+  const { store } = makeStore();
+  const added = store.addColumn('Временная');
+  assert.equal(added.ok, true);
+  const created = store.createTask({ columnId: added.column.id, text: 'Не теряюсь', x: 40, y: 50 });
+  assert.equal(created.ok, true);
+  const result = store.removeColumn(added.column.id, () => 'pool');
+  assert.equal(result.ok, true);
+  assert.equal(result.moved, 1);
+  const kept = store.getTask(created.task.id);
+  assert.ok(kept, 'задача жива');
+  assert.equal(kept.x, 40, 'x не изменился');
+  assert.equal(kept.y, 50, 'y не изменился');
+  assert.equal(kept.columnId, 'pool', 'переназначена в пул');
+});
+
+test('removeColumn: без reassign задачи уходят в первую оставшуюся колонку', () => {
+  const { store } = makeStore({
+    board: {
+      columns: [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }],
+      tasks: [{ id: 't1', columnId: 'b', text: 'Задача', order: 1000, x: 10, y: 20 }],
+    },
+  });
+  const result = store.removeColumn('b');
+  assert.equal(result.ok, true);
+  const kept = store.getTask('t1');
+  assert.ok(kept);
+  assert.equal(kept.columnId, 'a');
+  assert.equal(kept.x, 10);
+});
+
+test('removeColumn: последняя колонка не удаляется', () => {
+  const { store } = makeStore({
+    board: {
+      columns: [{ id: 'only', title: 'Одна' }],
+      tasks: [],
+    },
+  });
+  const result = store.removeColumn('only');
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'last-column');
+});
+
+test('updatePositionsBatch: тихий батч меняет только x', () => {
+  const { store } = makeStore();
+  const created = store.createTask({ columnId: 'pool', text: 'Едущий', x: 10, y: 20 });
+  assert.equal(created.ok, true);
+  let events = 0;
+  const off = store.subscribe((event) => {
+    if (event.type === 'change') events += 1;
+  });
+  const result = store.updatePositionsBatch([{ id: created.task.id, x: 100 }]);
+  assert.equal(result.ok, true);
+  assert.equal(result.updated, 1);
+  assert.equal(events, 1, 'одно событие на батч');
+  const after = store.getTask(created.task.id);
+  assert.equal(after.x, 100);
+  assert.equal(after.y, 20, 'y не тронут');
+  const noop = store.updatePositionsBatch([{ id: created.task.id, x: 100 }]);
+  assert.equal(noop.updated, 0);
+  off();
+});
+
+test('flush: асинхронное хранилище резолвится без потери статуса', async () => {
+  const storage = memoryStorage(null);
+  let resolveSave = null;
+  const asyncStorage = {
+    load: storage.load,
+    save: (payload) =>
+      new Promise((resolve) => {
+        resolveSave = () => {
+          storage.save(payload);
+          resolve({ ok: true });
+        };
+      }),
+  };
+  const store = new Core.KanbanStore({ storage: asyncStorage, autosaveMs: 1 });
+  store.init();
+  store.createTask({ columnId: 'pool', text: 'Асинхронная' });
+  const pending = store.flush();
+  assert.equal(typeof pending.then, 'function', 'flush вернул промис');
+  resolveSave();
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.ok(storage.peek(), 'доска записана после резолва');
+});
+
+test('flush: ответ {ok:false} от invoke превращается в save-error', async () => {
+  const store = new Core.KanbanStore({
+    storage: { load: () => null, save: () => Promise.resolve({ ok: false, error: 'диск полон' }) },
+    autosaveMs: 1,
+  });
+  store.init();
+  store.createTask({ columnId: 'pool', text: 'Ошибка диска' });
+  const result = await store.flush();
+  assert.equal(result.ok, false);
+  assert.equal(store.lastSaveError(), 'диск полон');
+});
+
+test('flushSync: блокирующая запись для выгрузки', () => {
+  const storage = memoryStorage(null);
+  const store = new Core.KanbanStore({
+    storage: Object.assign({}, storage, {
+      saveSync: (payload) => storage.save(payload),
+      save: () => Promise.resolve({ ok: true }),
+    }),
+    autosaveMs: 10000,
+  });
+  store.init();
+  if (store.hasPendingSave()) store.flushSync();
+  store.createTask({ columnId: 'pool', text: 'Перед закрытием' });
+  const result = store.flushSync();
+  assert.equal(result.ok, true);
+  assert.ok(storage.peek(), 'доска записана синхронно');
 });

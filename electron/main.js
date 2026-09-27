@@ -46,7 +46,7 @@ function readBoard() {
   }
 }
 
-function writeBoard(payload) {
+function validateBoardPayload(payload) {
   if (payload === null || typeof payload !== 'object') {
     throw new Error('payload должен быть объектом');
   }
@@ -60,9 +60,45 @@ function writeBoard(payload) {
   if (text.length > MAX_BOARD_BYTES) {
     throw new Error('доска слишком большая для сохранения');
   }
+  return text;
+}
+
+// Ротация бэкапов: текущий файл → .bak, прошлый .bak → .bak.1.
+function rotateBackup() {
+  try {
+    if (!fs.existsSync(boardFile)) return;
+    const bak = `${boardFile}.bak`;
+    const bak1 = `${boardFile}.bak.1`;
+    if (fs.existsSync(bak)) {
+      fs.copyFileSync(bak, bak1);
+    }
+    fs.copyFileSync(boardFile, bak);
+  } catch (error) {
+    console.error('[kanban] не удалось сделать бэкап:', error.message);
+  }
+}
+
+function writeBoard(payload) {
+  const text = validateBoardPayload(payload);
+  rotateBackup();
   const tempFile = `${boardFile}.tmp`;
   fs.writeFileSync(tempFile, text, 'utf8');
   fs.renameSync(tempFile, boardFile);
+}
+
+// Очередь асинхронных записей: рендерер не ждёт диск (invoke),
+// порядок соблюдается цепочкой промисов.
+let saveQueue = Promise.resolve();
+
+function writeBoardAsync(payload) {
+  const text = validateBoardPayload(payload);
+  saveQueue = saveQueue.then(() => {
+    rotateBackup();
+    const tempFile = `${boardFile}.tmp`;
+    fs.writeFileSync(tempFile, text, 'utf8');
+    fs.renameSync(tempFile, boardFile);
+  });
+  return saveQueue;
 }
 
 function registerIpc() {
@@ -70,6 +106,7 @@ function registerIpc() {
     event.returnValue = readBoard();
   });
 
+  // Синхронный путь оставлен для выгрузки (beforeunload) и смоук-проверок.
   ipcMain.on('board:save-sync', (event, payload) => {
     try {
       writeBoard(payload);
@@ -77,6 +114,57 @@ function registerIpc() {
     } catch (error) {
       console.error('[kanban] ошибка сохранения:', error.message);
       event.returnValue = { ok: false, error: error.message };
+    }
+  });
+
+  // Основной путь: асинхронный, рендерер продолжает жить без фриза.
+  ipcMain.handle('board:save', async (event, payload) => {
+    try {
+      await writeBoardAsync(payload);
+      return { ok: true };
+    } catch (error) {
+      console.error('[kanban] ошибка сохранения:', error.message);
+      return { ok: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('board:export', async () => {
+    const { dialog } = require('electron');
+    const target = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const { canceled, filePath } = await dialog.showSaveDialog(target || undefined, {
+      title: 'Экспорт доски',
+      defaultPath: 'kanban-board.json',
+      filters: [{ name: 'Канбан-доска (JSON)', extensions: ['json'] }],
+    });
+    if (canceled || !filePath) return { ok: false, reason: 'cancelled' };
+    try {
+      const raw = fs.readFileSync(boardFile, 'utf8');
+      fs.writeFileSync(filePath, raw, 'utf8');
+      return { ok: true, filePath };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('board:import', async () => {
+    const { dialog } = require('electron');
+    const target = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const { canceled, filePaths } = await dialog.showOpenDialog(target || undefined, {
+      title: 'Импорт доски',
+      filters: [{ name: 'Канбан-доска (JSON)', extensions: ['json'] }],
+      properties: ['openFile'],
+    });
+    if (canceled || !filePaths.length) return { ok: false, reason: 'cancelled' };
+    try {
+      const raw = fs.readFileSync(filePaths[0], 'utf8');
+      const parsed = JSON.parse(raw);
+      const board = parsed && typeof parsed === 'object' && 'board' in parsed ? parsed.board : parsed;
+      if (!board || !Array.isArray(board.tasks) || !Array.isArray(board.columns)) {
+        return { ok: false, error: 'файл не похож на доску' };
+      }
+      return { ok: true, payload: { version: 1, savedAt: Date.now(), board } };
+    } catch (error) {
+      return { ok: false, error: error.message };
     }
   });
 
