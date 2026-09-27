@@ -21,8 +21,9 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const SCHEMA_VERSION = 1;
+  const SCHEMA_VERSION = 2;
   const DELETED_TASK_TTL_MS = 30 * 24 * 60 * 60 * 1000; // архив удалённых — 30 дней
+  const BOARD_NAME_LIMIT = 60;
 
   const DEFAULT_COLUMNS = [
     { id: 'pool', title: 'Пул задач', wipLimit: null, role: 'pool' },
@@ -360,7 +361,9 @@
       fresh.push(task);
     }
 
-    const board = { columns, tasks: fresh, theme: sanitizeTheme(raw.theme) };
+    const board = { columns, tasks: fresh };
+    // Тема в доске не хранится (v2: единая на пространство).
+    // sanitizeWorkspace и replaceAll забирают raw.theme отдельно.
     const repairedNow = normalizeOrders(board);
     return { board, issues, repaired: issues.length > 0 || repairedNow };
   }
@@ -385,6 +388,113 @@
       }
     }
     return changed;
+  }
+
+  // ---------------------------------------------------------------------
+  // Рабочее пространство: несколько досок в одном файле (схема v2).
+  // { version: 2, savedAt, activeBoardId, theme, boards: [{id, name, board}] }
+  // Тема единая на всё пространство. Файлы v1 ({board} или голая доска)
+  // мигрируют в одну доску «Моя доска», тема переезжает из board.theme.
+  // ---------------------------------------------------------------------
+
+  function sanitizeBoardName(raw, fallback) {
+    const clean = typeof raw === 'string' ? raw.trim().replace(/\s+/g, ' ').slice(0, BOARD_NAME_LIMIT) : '';
+    if (clean) return clean;
+    return typeof fallback === 'string' && fallback ? fallback : 'Доска';
+  }
+
+  function newBoardId(now, seen) {
+    let id = `b-${now.toString(36)}-${Math.floor(Math.random() * 0xffffff).toString(36)}`;
+    let suffix = 2;
+    while (!id || !/^[A-Za-z0-9_-]+$/.test(id) || (seen && seen.has(id))) {
+      id = `b-${now.toString(36)}-${suffix.toString(36)}`;
+      suffix += 1;
+    }
+    if (seen) seen.add(id);
+    return id;
+  }
+
+  // Пустая доска для новых проектов: те же колонки, без демо-стикеров.
+  function emptyBoardData() {
+    return { columns: DEFAULT_COLUMNS.map((column) => Object.assign({}, column)), tasks: [] };
+  }
+
+  function sanitizeBoardEntry(raw, now, seenIds, fallbackName) {
+    const issues = [];
+    const source = isPlainObject(raw) ? raw : {};
+    let id = typeof source.id === 'string' ? source.id.trim() : '';
+    if (!id || !/^[A-Za-z0-9_-]+$/.test(id) || seenIds.has(id)) {
+      if (id && seenIds.has(id)) issues.push(`duplicate board id: ${id}`);
+      id = newBoardId(now, seenIds);
+      issues.push('board id regenerated');
+    } else {
+      seenIds.add(id);
+    }
+    const name = sanitizeBoardName(source.name, fallbackName);
+    if (name !== source.name) issues.push(`board renamed: ${id}`);
+    const boardSource = isPlainObject(source.board) ? source.board : source;
+    const result = sanitizeBoard(boardSource, now);
+    let board = result.board;
+    if (!board) {
+      board = sanitizeBoard(emptyBoardData(), now).board;
+      issues.push(`board reset to empty: ${id}`);
+    }
+    if (result.repaired) issues.push(`board repaired: ${id}`);
+    issues.push(...result.issues.map((issue) => `${id}: ${issue}`));
+    return { entry: { id, name, board }, issues };
+  }
+
+  function sanitizeWorkspace(raw, now) {
+    const issues = [];
+    const time = Number.isFinite(now) ? now : Date.now();
+    // Пустое хранилище — не миграция, а первый запуск: init поднимет seed.
+    if (raw === null || raw === undefined) {
+      return { workspace: null, issues: ['empty storage — seeding'], repaired: false };
+    }
+    const seenIds = new Set();
+    let boards = [];
+    let activeBoardId = null;
+    let theme = DEFAULT_THEME;
+
+    if (isPlainObject(raw) && Array.isArray(raw.boards)) {
+      // Формат v2.
+      theme = sanitizeTheme(raw.theme);
+      if (raw.theme !== undefined && theme !== raw.theme) issues.push('unknown theme — using default');
+      let counter = 0;
+      for (const item of raw.boards) {
+        counter += 1;
+        const { entry, issues: entryIssues } = sanitizeBoardEntry(item, time, seenIds, `Доска ${counter}`);
+        boards.push(entry);
+        issues.push(...entryIssues);
+      }
+      if (typeof raw.activeBoardId === 'string' && seenIds.has(raw.activeBoardId)) {
+        activeBoardId = raw.activeBoardId;
+      } else {
+        issues.push('unknown activeBoardId — using first board');
+      }
+    } else {
+      // Миграция v1: {version:1, board} или голая доска {columns, tasks}.
+      const source = isPlainObject(raw) && "board" in raw ? raw.board : raw;
+      const boardTheme = isPlainObject(source) && typeof source.theme === 'string' ? source.theme : undefined;
+      theme = sanitizeTheme(boardTheme);
+      const { entry, issues: entryIssues } = sanitizeBoardEntry(
+        { id: 'board-1', name: 'Моя доска', board: source }, time, seenIds, 'Моя доска'
+      );
+      boards.push(entry);
+      issues.push('migrated v1 → v2: single board «Моя доска»');
+      issues.push(...entryIssues);
+    }
+
+    if (boards.length === 0) {
+      const seed = sanitizeBoard(seedBoardData(), time).board;
+      boards.push({ id: 'board-1', name: 'Моя доска', board: seed });
+      seenIds.add('board-1');
+      issues.push('no valid boards — seeded «Моя доска»');
+    }
+    if (!activeBoardId || !seenIds.has(activeBoardId)) activeBoardId = boards[0].id;
+
+    const workspace = { boards, activeBoardId, theme };
+    return { workspace, issues, repaired: issues.length > 0 };
   }
 
   // ---------------------------------------------------------------------
@@ -461,7 +571,14 @@
       this._autosaveMs = Number.isFinite(settings.autosaveMs) ? settings.autosaveMs : 400;
       this._clock = settings.clock || (() => Date.now());
       this._idCounter = 0;
+      this._boardCounter = 0;
+      // Мультидоска: _boards — все доски [{id, name, board}],
+      // _board — ссылка на board активной (старые методы не меняются),
+      // _theme — единая тема пространства.
+      this._boards = [];
+      this._activeBoardId = null;
       this._board = null;
+      this._theme = DEFAULT_THEME;
       this._query = '';
       this._listeners = new Set();
       this._saveTimer = null;
@@ -475,7 +592,7 @@
 
     init() {
       const now = this._clock();
-      let board = null;
+      let workspace = null;
       if (this._storage) {
         let raw = null;
         try {
@@ -483,22 +600,25 @@
         } catch (error) {
           this._loadReport.issues.push(`load failed: ${error.message}`);
         }
-        if (isPlainObject(raw) && raw.version !== undefined && raw.version !== SCHEMA_VERSION) {
+        if (isPlainObject(raw) && raw.version !== undefined && raw.version !== SCHEMA_VERSION && raw.version !== 1) {
           this._loadReport.issues.push(`unknown version ${raw.version}; best-effort load`);
         }
-        const source = isPlainObject(raw) && "board" in raw ? raw.board : raw;
-        const result = sanitizeBoard(source, now);
-        if (result.board) {
-          board = result.board;
+        const result = sanitizeWorkspace(raw, now);
+        if (result.workspace) {
+          workspace = result.workspace;
           this._loadReport.repaired = result.repaired;
           this._loadReport.issues.push(...result.issues);
         }
       }
-      if (!board) {
-        board = sanitizeBoard(seedBoardData(this._clock), now).board;
+      if (!workspace) {
+        const seed = sanitizeBoard(seedBoardData(), now).board;
+        workspace = { boards: [{ id: 'board-1', name: 'Моя доска', board: seed }], activeBoardId: 'board-1', theme: DEFAULT_THEME };
         this._loadReport.seeded = true;
       }
-      this._board = board;
+      this._boards = workspace.boards;
+      this._activeBoardId = workspace.activeBoardId;
+      this._theme = workspace.theme;
+      this._syncActiveRef();
       if (this._loadReport.seeded || this._loadReport.repaired) {
         this._dirty = true;
         this._scheduleSave(0);
@@ -519,6 +639,102 @@
           console.error('[kanban] listener error:', error);
         }
       }
+    }
+
+    // -- доски (рабочее пространство) ------------------------------------
+
+    _activeEntry() {
+      return this._boards.find((entry) => entry.id === this._activeBoardId) || this._boards[0] || null;
+    }
+
+    _syncActiveRef() {
+      const entry = this._activeEntry();
+      this._activeBoardId = entry ? entry.id : null;
+      this._board = entry ? entry.board : null;
+    }
+
+    activeBoardId() {
+      return this._activeBoardId;
+    }
+
+    // Список для вкладок: id, имя и число ОТКРЫТЫХ стикеров
+    // (завершённые и удалённые не считаются — как непрочитанное в ежедневнике).
+    listBoards() {
+      return this._boards.map((entry) => {
+        const doneIds = new Set(
+          entry.board.columns.filter((column) => column.role === 'done').map((column) => column.id)
+        );
+        return {
+          id: entry.id,
+          name: entry.name,
+          taskCount: entry.board.tasks.filter(
+            (task) => task.deletedAt === null && !doneIds.has(task.columnId)
+          ).length,
+        };
+      });
+    }
+
+    _nextBoardId() {
+      this._boardCounter += 1;
+      const now = this._clock();
+      let id = `b-${now.toString(36)}-${this._boardCounter.toString(36)}`;
+      const seen = new Set(this._boards.map((entry) => entry.id));
+      let suffix = 2;
+      while (seen.has(id)) {
+        id = `b-${now.toString(36)}-${this._boardCounter.toString(36)}-${suffix.toString(36)}`;
+        suffix += 1;
+      }
+      return id;
+    }
+
+    createBoard(name) {
+      const clean = sanitizeBoardName(name, `Доска ${this._boards.length + 1}`);
+      const entry = {
+        id: this._nextBoardId(),
+        name: clean,
+        board: sanitizeBoard(emptyBoardData(), this._clock()).board,
+      };
+      this._boards.push(entry);
+      this._activeBoardId = entry.id;
+      this._query = '';
+      this._syncActiveRef();
+      this._afterChange('board-create');
+      return { ok: true, board: { id: entry.id, name: entry.name } };
+    }
+
+    renameBoard(id, name) {
+      const entry = this._boards.find((item) => item.id === id);
+      if (!entry) return { ok: false, reason: 'not-found' };
+      const clean = typeof name === 'string' ? name.trim().replace(/\s+/g, ' ').slice(0, BOARD_NAME_LIMIT) : '';
+      if (!clean) return { ok: false, reason: 'empty-title' };
+      if (clean === entry.name) return { ok: true, board: { id: entry.id, name: entry.name } };
+      entry.name = clean;
+      this._afterChange('board-rename');
+      return { ok: true, board: { id: entry.id, name: entry.name } };
+    }
+
+    deleteBoard(id) {
+      const entry = this._boards.find((item) => item.id === id);
+      if (!entry) return { ok: false, reason: 'not-found' };
+      if (this._boards.length <= 1) return { ok: false, reason: 'last-board' };
+      this._boards = this._boards.filter((item) => item.id !== id);
+      if (this._activeBoardId === id) {
+        this._activeBoardId = this._boards[0].id;
+        this._query = '';
+      }
+      this._syncActiveRef();
+      this._afterChange('board-delete');
+      return { ok: true, activeBoardId: this._activeBoardId };
+    }
+
+    switchBoard(id) {
+      if (!this._boards.some((entry) => entry.id === id)) return { ok: false, reason: 'not-found' };
+      if (id === this._activeBoardId) return { ok: true, board: { id }, noop: true };
+      this._activeBoardId = id;
+      this._query = '';
+      this._syncActiveRef();
+      this._afterChange('board-switch');
+      return { ok: true, board: { id } };
     }
 
     // -- чтение ----------------------------------------------------------
@@ -598,16 +814,16 @@
       this._emit({ type: 'change', reason: 'query' });
     }
 
-    // -- тема оформления -------------------------------------------------
+    // -- тема оформления (единая на всё пространство) ----------------------
 
     getTheme() {
-      return sanitizeTheme(this._board.theme);
+      return sanitizeTheme(this._theme);
     }
 
     setTheme(id) {
       if (!THEMES.some((entry) => entry.id === id)) return { ok: false, reason: 'bad-theme' };
-      if (this._board.theme === id) return { ok: true, theme: id };
-      this._board.theme = id;
+      if (this._theme === id) return { ok: true, theme: id };
+      this._theme = id;
       this._afterChange('theme');
       return { ok: true, theme: id };
     }
@@ -999,6 +1215,17 @@
 
     // -- персистентность --------------------------------------------------
 
+    // Полный payload пространства (v2) для записи на диск.
+    _workspacePayload() {
+      return {
+        version: SCHEMA_VERSION,
+        savedAt: this._clock(),
+        activeBoardId: this._activeBoardId,
+        theme: this._theme,
+        boards: JSON.parse(JSON.stringify(this._boards)),
+      };
+    }
+
     _afterChange(reason, task, column) {
       const delay = reason === 'update' ? this._autosaveMs : 0;
       this._dirty = true;
@@ -1026,7 +1253,7 @@
         this._dirty = false;
         return { ok: true, savedAt: this._lastSavedAt, skipped: true };
       }
-      const payload = { version: SCHEMA_VERSION, savedAt: this._clock(), board: this.snapshot() };
+      const payload = this._workspacePayload();
       let result;
       try {
         result = this._storage.save(payload);
@@ -1081,7 +1308,7 @@
         this._dirty = false;
         return { ok: true, savedAt: this._lastSavedAt, skipped: true };
       }
-      const payload = { version: SCHEMA_VERSION, savedAt: this._clock(), board: this.snapshot() };
+      const payload = this._workspacePayload();
       try {
         if (typeof this._storage.saveSync === 'function') {
           this._storage.saveSync(payload);
@@ -1104,13 +1331,34 @@
     }
 
     /**
-     * Замена доски целиком (импорт/аварийное восстановление).
-     * Используется тестами и инструментами; UI пока не вызывает.
+     * Замена данных целиком (импорт/аварийное восстановление).
+     * Принимает и пространство v2 ({boards}), и одиночную доску v1 —
+     * одиночная заменяет АКТИВНУЮ доску, остальные не трогает.
+     * Используется тестами и инструментами; UI вызывает при импорте из файла.
      */
     replaceAll(payload) {
+      if (isPlainObject(payload) && Array.isArray(payload.boards)) {
+        const result = sanitizeWorkspace(payload, this._clock());
+        if (!result.workspace || !result.workspace.boards.length) return { ok: false, reason: 'bad-payload' };
+        this._boards = result.workspace.boards;
+        this._activeBoardId = result.workspace.activeBoardId;
+        this._theme = result.workspace.theme;
+        this._query = '';
+        this._syncActiveRef();
+        this._afterChange('replace');
+        return { ok: true, report: { repaired: result.repaired, issues: result.issues } };
+      }
       const result = sanitizeBoard(isPlainObject(payload) && "board" in payload ? payload.board : payload, this._clock());
       if (!result.board) return { ok: false, reason: 'bad-payload' };
-      this._board = result.board;
+      const entry = this._activeEntry();
+      if (!entry) return { ok: false, reason: 'no-boards' };
+      entry.board = result.board;
+      // Импорт старого файла с темой внутри доски: тема применяется глобально.
+      const source = isPlainObject(payload) && "board" in payload ? payload.board : payload;
+      if (isPlainObject(source) && typeof source.theme === 'string' && THEMES.some((item) => item.id === source.theme)) {
+        this._theme = source.theme;
+      }
+      this._syncActiveRef();
       this._afterChange('replace');
       return { ok: true, report: { repaired: result.repaired, issues: result.issues } };
     }
@@ -1137,6 +1385,8 @@
     todayString,
     localDateString,
     sanitizeBoard,
+    sanitizeWorkspace,
+    sanitizeBoardName,
     normalizeOrders,
     computeReflowX,
     KanbanStore,

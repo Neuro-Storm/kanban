@@ -224,20 +224,21 @@ test('тема: по умолчанию крафт, валидная стави�
   assert.equal(store.getTheme(), 'kraft');
   assert.equal(store.setTheme('cork').ok, true);
   assert.equal(store.getTheme(), 'cork');
-  assert.equal(store.snapshot().theme, 'cork');
+  assert.equal('theme' in store.snapshot(), false, 'тема живёт в пространстве, а не в доске');
   const bad = store.setTheme('бархат');
   assert.equal(bad.ok, false);
   assert.equal(bad.reason, 'bad-theme');
   assert.equal(store.getTheme(), 'cork');
 });
 
-test('тема: санитизация сохраняет хорошую и чинит битую', () => {
-  const good = Core.sanitizeBoard({ columns: [], tasks: [], theme: 'graphite' }, Date.now());
-  assert.equal(good.board.theme, 'graphite');
-  const bad = Core.sanitizeBoard({ columns: [], tasks: [], theme: 'бархат' }, Date.now());
-  assert.equal(bad.board.theme, 'kraft');
-  const missing = Core.sanitizeBoard({ columns: [], tasks: [] }, Date.now());
-  assert.equal(missing.board.theme, 'kraft');
+test('тема: в доске не хранится, живёт в пространстве', () => {
+  const cleaned = Core.sanitizeBoard({ columns: [], tasks: [], theme: 'graphite' }, Date.now());
+  assert.equal('theme' in cleaned.board, false);
+  const { store } = makeStore({
+    version: 1,
+    board: { columns: [{ id: 'pool', title: 'Пул' }], tasks: [], theme: 'graphite' },
+  });
+  assert.equal(store.getTheme(), 'graphite', 'миграция забрала тему из v1-доски');
 });
 
 test('удаление: мягкое, возврат восстанавливает задачу', () => {
@@ -313,7 +314,10 @@ test('сохранение: изменение планирует запись, 
   const saved = storage.peek();
   assert.equal(saved.version, Core.SCHEMA_VERSION);
   assert.equal(typeof saved.savedAt, 'number');
-  assert.ok(Array.isArray(saved.board.tasks));
+  assert.ok(Array.isArray(saved.boards));
+  assert.equal(saved.activeBoardId, store.activeBoardId());
+  assert.equal(saved.theme, 'kraft');
+  assert.ok(Array.isArray(saved.boards[0].board.tasks));
   assert.equal(store.hasPendingSave(), false);
   assert.ok(store.lastSavedAt() > 0);
 });
@@ -657,4 +661,158 @@ test('flushSync: блокирующая запись для выгрузки', (
   const result = store.flushSync();
   assert.equal(result.ok, true);
   assert.ok(storage.peek(), 'доска записана синхронно');
+});
+
+test('доски: старт — одна «Моя доска» с шестью стикерами', () => {
+  const { store } = makeStore();
+  const boards = store.listBoards();
+  assert.equal(boards.length, 1);
+  assert.equal(boards[0].name, 'Моя доска');
+  assert.equal(boards[0].taskCount, 5, 'счётчик без завершённых (seed-6 в done)');
+  assert.equal(store.activeBoardId(), boards[0].id);
+});
+
+test('миграция: v1-файл становится «Моей доской», тема переезжает в пространство', () => {
+  const { store } = makeStore({
+    version: 1,
+    savedAt: 123,
+    board: {
+      columns: [{ id: 'pool', title: 'Пул' }],
+      tasks: [{ id: 'a', columnId: 'pool', text: 'Живая', order: 1000 }],
+      theme: 'cork',
+    },
+  });
+  const boards = store.listBoards();
+  assert.equal(boards.length, 1);
+  assert.equal(boards[0].name, 'Моя доска');
+  assert.equal(boards[0].taskCount, 1);
+  assert.equal(store.getTheme(), 'cork');
+  assert.equal(store.getTask('a').text, 'Живая');
+});
+
+test('миграция: голая доска без версии тоже мигрирует', () => {
+  const { store } = makeStore({ columns: [{ id: 'pool', title: 'Пул' }], tasks: [] });
+  assert.equal(store.listBoards().length, 1);
+  assert.equal(store.snapshot().columns.length, 1);
+});
+
+test('доски: создание пустой, переключение, изоляция задач', () => {
+  const { store } = makeStore();
+  const firstId = store.activeBoardId();
+  const created = store.createBoard('Проект Б');
+  assert.equal(created.ok, true);
+  assert.equal(created.board.name, 'Проект Б');
+  assert.equal(store.activeBoardId(), created.board.id);
+  assert.equal(store.listBoards().length, 2);
+  // Новая доска пустая: те же колонки, ноль стикеров.
+  assert.equal(store.snapshot().columns.length, 5);
+  assert.equal(store.view().stats.total, 0);
+  store.createTask({ columnId: 'pool', text: 'Только здесь' });
+  assert.equal(store.view().stats.total, 1);
+
+  assert.equal(store.switchBoard(firstId).ok, true);
+  assert.equal(store.view().stats.total, 6, 'первая доска нетронута');
+  assert.equal(store.getTask('seed-1').text.includes('вики'), true);
+
+  assert.equal(store.switchBoard(created.board.id).ok, true);
+  assert.equal(store.view().stats.total, 1);
+  assert.equal(store.getTask('seed-1'), null, 'чужих задач не видно');
+});
+
+test('доски: переключение в никуда отклоняется, повтор — noop', () => {
+  const { store } = makeStore();
+  const bad = store.switchBoard('нет-такой');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'not-found');
+  const again = store.switchBoard(store.activeBoardId());
+  assert.equal(again.ok, true);
+  assert.equal(again.noop, true);
+});
+
+test('доски: переименование и пустое имя', () => {
+  const { store } = makeStore();
+  const id = store.activeBoardId();
+  assert.equal(store.renameBoard(id, '  Ремонт  ').ok, true);
+  assert.equal(store.listBoards()[0].name, 'Ремонт');
+  const empty = store.renameBoard(id, '   ');
+  assert.equal(empty.ok, false);
+  assert.equal(empty.reason, 'empty-title');
+  const missing = store.renameBoard('нет-такой', 'X');
+  assert.equal(missing.ok, false);
+  assert.equal(missing.reason, 'not-found');
+});
+
+test('доски: удаление активной переключает на первую, последнюю удалить нельзя', () => {
+  const { store } = makeStore();
+  const firstId = store.activeBoardId();
+  const second = store.createBoard('Вторая');
+  store.createTask({ columnId: 'pool', text: 'Мусор' });
+  const removed = store.deleteBoard(second.board.id);
+  assert.equal(removed.ok, true);
+  assert.equal(store.activeBoardId(), firstId);
+  assert.equal(store.listBoards().length, 1);
+  const last = store.deleteBoard(firstId);
+  assert.equal(last.ok, false);
+  assert.equal(last.reason, 'last-board');
+  assert.equal(store.listBoards().length, 1);
+});
+
+test('доски: replaceAll чинит пространство v2 и одиночную в активную', () => {
+  const { store } = makeStore();
+  const ws = {
+    version: 2,
+    savedAt: Date.now(),
+    activeBoardId: 'nb',
+    theme: 'graphite',
+    boards: [
+      { id: 'nb', name: 'Новая', board: { columns: [{ id: 'pool', title: 'Пул' }], tasks: [] } },
+    ],
+  };
+  assert.equal(store.replaceAll(ws).ok, true);
+  assert.equal(store.listBoards().length, 1);
+  assert.equal(store.getTheme(), 'graphite');
+  assert.equal(store.activeBoardId(), 'nb');
+  // Одиночная доска заменяет только активную.
+  const other = store.createBoard('Другая');
+  store.switchBoard('nb');
+  assert.equal(store.replaceAll({ columns: [{ id: 'pool', title: 'Пул' }], tasks: [] }).ok, true);
+  assert.equal(store.listBoards().length, 2);
+  assert.equal(store.activeBoardId(), 'nb');
+  store.switchBoard(other.board.id);
+  assert.equal(store.view().stats.total, 0);
+  const bad = store.replaceAll(null);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'bad-payload');
+});
+
+test('доски: запрос поиска сбрасывается при переключении', () => {
+  const { store } = makeStore();
+  store.setQuery('вики');
+  assert.equal(store.query, 'вики');
+  const second = store.createBoard('Вторая');
+  assert.equal(store.query, '', 'создание тоже сбрасывает фильтр');
+  store.setQuery('мусор');
+  store.switchBoard(store.listBoards()[0].id);
+  assert.equal(store.query, '');
+  assert.equal(second.board.name, 'Вторая');
+});
+
+test('доски: битое пространство чинится до рабочей «Моей доски»', () => {
+  const { store } = makeStore({
+    version: 2,
+    activeBoardId: 'призрак',
+    theme: 'бархат',
+    boards: [
+      { id: 'ok', name: 'Живая', board: { columns: [{ id: 'pool', title: 'Пул' }], tasks: [] } },
+      { id: 'ok', name: 'Дубль', board: { columns: [], tasks: [] } },
+      { id: 'плохой id!', name: 'Кривая', board: null },
+    ],
+  });
+  const boards = store.listBoards();
+  assert.equal(boards.length, 3);
+  assert.equal(store.activeBoardId(), 'ok', 'активная — первая валидная');
+  assert.equal(store.getTheme(), 'kraft', 'битая тема — дефолт');
+  for (const entry of boards) {
+    assert.match(entry.id, /^[A-Za-z0-9_-]+$/);
+  }
 });

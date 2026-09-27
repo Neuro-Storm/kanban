@@ -1,7 +1,8 @@
 /*
  * Главный процесс Electron: окно, файловое хранилище доски, режим смоук-теста.
  *
- * Доска лежит в одном JSON-файле в каталоге userData. Запись атомарная
+ * Доски лежат в одном JSON-файле рабочего пространства (схема v2)
+ * в каталоге userData. Запись атомарная
  * (временный файл + переименование), чтение — синхронное: рендерер
  * спрашивает хранилище в момент старта, когда показывать ещё нечего.
  */
@@ -50,6 +51,24 @@ function validateBoardPayload(payload) {
   if (payload === null || typeof payload !== 'object') {
     throw new Error('payload должен быть объектом');
   }
+  // Пространство v2: несколько досок в одном файле.
+  if (Array.isArray(payload.boards)) {
+    for (const entry of payload.boards) {
+      if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') {
+        throw new Error('payload.boards повреждён');
+      }
+      const board = entry.board;
+      if (!board || typeof board !== 'object' || !Array.isArray(board.tasks) || !Array.isArray(board.columns)) {
+        throw new Error('payload.boards повреждён');
+      }
+    }
+    const text = JSON.stringify(payload);
+    if (text.length > MAX_BOARD_BYTES) {
+      throw new Error('доски слишком большие для сохранения');
+    }
+    return text;
+  }
+  // Одиночная доска v1 (обратная совместимость).
   if (!payload.board || typeof payload.board !== 'object') {
     throw new Error('payload.board отсутствует');
   }
@@ -158,6 +177,11 @@ function registerIpc() {
     try {
       const raw = fs.readFileSync(filePaths[0], 'utf8');
       const parsed = JSON.parse(raw);
+      // Экспорт всего пространства (v2) импортируется целиком,
+      // одиночная доска (v1) — заменяет активную.
+      if (parsed && typeof parsed === 'object' && Array.isArray(parsed.boards)) {
+        return { ok: true, payload: parsed };
+      }
       const board = parsed && typeof parsed === 'object' && 'board' in parsed ? parsed.board : parsed;
       if (!board || !Array.isArray(board.tasks) || !Array.isArray(board.columns)) {
         return { ok: false, error: 'файл не похож на доску' };

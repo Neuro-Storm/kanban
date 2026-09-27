@@ -55,8 +55,8 @@ npm run dist:mac  # macOS dmg (собирается только на macOS)
 ## Разработка
 
 ```bash
-npm test          # юнит-тесты ядра доски (node --test), 43 проверки
-npm run smoke     # смоук-тест в настоящем Electron (90+ проверок: доска, drag, магнит, рамка, темы, рефлоу)
+npm test          # юнит-тесты ядра доски (node --test), 55 проверок
+npm run smoke     # смоук-тест в настоящем Electron (110+ проверок: доски, drag, магнит, рамка, темы, рефлоу)
 npm run shot      # снять кадры artifacts/preview.png и preview-editor.png
 ```
 

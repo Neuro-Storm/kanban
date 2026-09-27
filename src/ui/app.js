@@ -59,6 +59,8 @@
   const dom = {
     board: document.getElementById('board'),
     boardWrap: document.querySelector('.board-wrap'),
+    boardsList: document.getElementById('boardsList'),
+    addBoardBtn: document.getElementById('addBoardBtn'),
     addColumnBtn: document.getElementById('addColumnBtn'),
     bulkDeleteBtn: document.getElementById('bulkDeleteBtn'),
     exportBtn: document.getElementById('exportBtn'),
@@ -550,6 +552,7 @@
 
   function render() {
     applyTheme();
+    renderBoards();
     const view = store.view();
     const todayStr = Core.todayString(Date.now);
     const scroller = dom.boardWrap || document.documentElement;
@@ -897,11 +900,15 @@
       }
       return;
     }
-    // Фон доски — возможное OneNote-создание.
+    // Фон доски — возможное OneNote-создание. Полоса вкладок — не фон:
+    // клики по ней обслуживают вкладки, рамка и черновик там не стартуют.
     const onBoard = event.target.closest
       ? event.target.closest('#board, .board-wrap')
       : null;
-    if (onBoard && !isInteractiveTarget(event.target)) {
+    const onBoardsBar = event.target.closest
+      ? event.target.closest('.board-tabs')
+      : null;
+    if (onBoard && !onBoardsBar && !isInteractiveTarget(event.target)) {
       bgClick.pointerId = event.pointerId;
       bgClick.startClientX = event.clientX;
       bgClick.startClientY = event.clientY;
@@ -1381,6 +1388,7 @@
         upTarget &&
           upTarget.closest &&
           upTarget.closest('#board, .board-wrap') &&
+          !upTarget.closest('.board-tabs') &&
           !isInteractiveTarget(upTarget) &&
           !upTarget.closest('.board > .sticker')
       );
@@ -2216,6 +2224,232 @@
     if (!dom.confirmPop.hidden && !dom.confirmPop.contains(event.target)) closeConfirmPop();
   });
 
+  // ---------------------------------------------------------------------
+  // Вкладки досок: сайдбар слева. Клик — переключить, двойной клик —
+  // переименовать, правый клик — меню (переименовать/удалить).
+  // ---------------------------------------------------------------------
+
+  let boardRename = null; // { boardId } — пока правим имя, вкладки не перестраиваем
+
+  function renderBoards() {
+    if (!dom.boardsList) return;
+    if (boardRename) return;
+    const boards = store.listBoards();
+    const activeId = store.activeBoardId();
+    dom.boardsList.innerHTML = '';
+    for (const entry of boards) {
+      const tab = element('button', `board-tab${entry.id === activeId ? ' active' : ''}`);
+      tab.type = 'button';
+      tab.dataset.boardId = entry.id;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', entry.id === activeId ? 'true' : 'false');
+      tab.title = `${entry.name} — открытых: ${entry.taskCount}. Клик — открыть, двойной клик — переименовать, правый клик — удалить`;
+      tab.appendChild(element('span', 'board-tab-name', entry.name));
+      tab.appendChild(element('span', 'board-tab-count', String(entry.taskCount)));
+      tab.addEventListener('click', () => switchToBoard(entry.id));
+      tab.addEventListener('dblclick', (event) => {
+        event.preventDefault();
+        startBoardRename(entry.id, tab);
+      });
+      tab.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        openBoardMenu(entry.id, tab);
+      });
+      dom.boardsList.appendChild(tab);
+    }
+  }
+
+  function switchToBoard(boardId) {
+    if (!boardId || boardId === store.activeBoardId()) return;
+    closeConfirmPop();
+    if (draftNode) commitDraft();
+    if (inlineEdit.node) commitInlineEdit();
+    closeDraft(true);
+    hideFormatPop();
+    store.flushSync();
+    // Поиск — в пределах доски: при переключении сбрасываем.
+    if (dom.searchInput.value !== '') {
+      dom.searchInput.value = '';
+      store.setQuery('');
+    }
+    selectedIds.clear();
+    const result = store.switchBoard(boardId);
+    if (!result.ok) {
+      toast('Не получилось переключить доску', null);
+      return;
+    }
+    // render() уже вызван подпиской; дотягиваем геометрию новой доски.
+    repairCenteredStickers();
+    render();
+    snapshotGeom();
+  }
+
+  // Переименование — горизонтальной плавающей карточкой у закладки:
+  // вертикальный ярлычок для ввода не годится.
+  function startBoardRename(boardId, anchor) {
+    const entry = store.listBoards().find((item) => item.id === boardId);
+    if (!entry) return;
+    closeConfirmPop();
+    boardRename = { boardId };
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'board-tab-rename';
+    input.value = entry.name;
+    input.maxLength = 60;
+    input.setAttribute('aria-label', 'Имя доски');
+    dom.confirmPop.innerHTML = '';
+    dom.confirmPop.appendChild(input);
+    dom.confirmPop.hidden = false;
+    if (anchor && anchor.getBoundingClientRect) {
+      const rect = anchor.getBoundingClientRect();
+      let left = rect.right + 8;
+      let top = rect.top - 8;
+      if (left + 210 > window.innerWidth) left = Math.max(10, rect.left - 210);
+      if (top < 10) top = 10;
+      dom.confirmPop.style.left = `${left}px`;
+      dom.confirmPop.style.top = `${top}px`;
+    } else {
+      dom.confirmPop.style.left = '60px';
+      dom.confirmPop.style.top = '120px';
+    }
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (commit) => {
+      if (done) return;
+      done = true;
+      boardRename = null;
+      const value = input.value;
+      closeConfirmPop();
+      if (commit) {
+        const result = store.renameBoard(boardId, value);
+        if (!result.ok) toast('Имя доски не должно быть пустым', null);
+      }
+      renderBoards();
+    };
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        finish(true);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(false);
+      }
+      event.stopPropagation();
+    });
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('click', (event) => event.stopPropagation());
+    input.addEventListener('dblclick', (event) => event.stopPropagation());
+    input.addEventListener('pointerdown', (event) => event.stopPropagation());
+    input.addEventListener('contextmenu', (event) => event.stopPropagation());
+  }
+
+  function openBoardMenu(boardId, anchor) {
+    const entry = store.listBoards().find((item) => item.id === boardId);
+    if (!entry) return;
+    closeConfirmPop();
+
+    const pop = element('div', 'column-menu');
+    pop.style.cssText =
+      'position:fixed;z-index:50;background:var(--paper);border-radius:12px;' +
+      'box-shadow:0 18px 40px -14px rgba(40,34,22,.55);padding:10px;display:flex;' +
+      'flex-direction:column;gap:6px;min-width:200px;';
+    const title = element('div', 'field-label', entry.name);
+    title.style.cssText =
+      'padding:4px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;';
+    pop.appendChild(title);
+
+    const renameBtn = element('button', 'tag-chip', 'Переименовать');
+    renameBtn.addEventListener('click', () => {
+      const tab = dom.boardsList
+        ? dom.boardsList.querySelector(`:scope > .board-tab[data-board-id="${boardId}"]`)
+        : null;
+      startBoardRename(boardId, tab);
+    });
+    pop.appendChild(renameBtn);
+
+    const removeBtn = element('button', 'btn btn-ghost-danger', 'Удалить доску');
+    removeBtn.addEventListener('click', () => {
+      if (store.listBoards().length <= 1) {
+        toast('Последнюю доску удалить нельзя', null);
+        closeConfirmPop();
+        return;
+      }
+      // Второй шаг — подтверждение: стикеры доски пропадут навсегда.
+      pop.innerHTML = '';
+      const warn = element('div', 'field-label', `Удалить «${entry.name}» со всеми стикерами?`);
+      warn.style.cssText = 'padding:4px 6px;max-width:220px;';
+      pop.appendChild(warn);
+      const yesBtn = element('button', 'btn btn-ghost-danger', 'Да, удалить');
+      yesBtn.addEventListener('click', () => {
+        if (draftNode) commitDraft();
+        if (inlineEdit.node) commitInlineEdit();
+        closeDraft(true);
+        store.flushSync();
+        const result = store.deleteBoard(boardId);
+        closeConfirmPop();
+        if (!result.ok) {
+          toast(result.reason === 'last-board' ? 'Последнюю доску удалить нельзя' : 'Не получилось удалить доску', null);
+          return;
+        }
+        selectedIds.clear();
+        if (dom.searchInput.value !== '') {
+          dom.searchInput.value = '';
+          store.setQuery('');
+        }
+        render();
+        repairCenteredStickers();
+        render();
+        snapshotGeom();
+        toast('Доска удалена', null);
+      });
+      const noBtn = element('button', 'tag-chip', 'Отмена');
+      noBtn.addEventListener('click', closeConfirmPop);
+      pop.appendChild(yesBtn);
+      pop.appendChild(noBtn);
+    });
+    pop.appendChild(removeBtn);
+
+    dom.confirmPop.innerHTML = '';
+    dom.confirmPop.appendChild(pop);
+    dom.confirmPop.hidden = false;
+    const rect = anchor.getBoundingClientRect();
+    const popRect = dom.confirmPop.getBoundingClientRect();
+    let left = rect.right - popRect.width;
+    let top = rect.bottom + 8;
+    if (left < 10) left = 10;
+    if (top + popRect.height > window.innerHeight - 10) top = rect.top - popRect.height - 8;
+    dom.confirmPop.style.left = `${left}px`;
+    dom.confirmPop.style.top = `${top}px`;
+  }
+
+  if (dom.addBoardBtn) {
+    dom.addBoardBtn.addEventListener('click', () => {
+      closeConfirmPop();
+      if (draftNode) commitDraft();
+      if (inlineEdit.node) commitInlineEdit();
+      closeDraft(true);
+      hideFormatPop();
+      store.flushSync();
+      if (dom.searchInput.value !== '') dom.searchInput.value = '';
+      selectedIds.clear();
+      const result = store.createBoard(`Доска ${store.listBoards().length + 1}`);
+      if (!result.ok) {
+        toast('Не получилось создать доску', null);
+        return;
+      }
+      render();
+      repairCenteredStickers();
+      render();
+      snapshotGeom();
+      toast('Новая доска — введи ей имя', null);
+      const newTab = dom.boardsList
+        ? dom.boardsList.querySelector(`:scope > .board-tab[data-board-id="${result.board.id}"]`)
+        : null;
+      startBoardRename(result.board.id, newTab);
+    });
+  }
+
   dom.addColumnBtn.addEventListener('click', () => {
     const snapshot = store.snapshot();
     const suggested = `Колонка ${snapshot.columns.length + 1}`;
@@ -2542,13 +2776,18 @@
       // Детерминированно — через блокирующий flushSync.
       store.flushSync();
       const raw = window.kanbanAPI ? window.kanbanAPI.loadBoard() : null;
-      if (raw) {
-        check('persist: доска записана', Array.isArray(raw.board.tasks) && raw.board.tasks.length > 0);
+      const savedBoards = raw && Array.isArray(raw.boards) ? raw.boards : null;
+      const savedActive = savedBoards
+        ? savedBoards.find((entry) => entry.id === raw.activeBoardId) || savedBoards[0]
+        : null;
+      const savedTasks = savedActive && savedActive.board ? savedActive.board.tasks : null;
+      if (Array.isArray(savedTasks)) {
+        check('persist: пространство записано', savedBoards.length >= 1 && typeof raw.theme === 'string');
         check('persist: сохранились 3 задачи в работе',
-          raw.board.tasks.filter((task) => task.columnId === 'in-progress' && !task.deletedAt).length === 3,
-          String(raw.board.tasks.filter((task) => task.columnId === 'in-progress' && !task.deletedAt).length));
+          savedTasks.filter((task) => task.columnId === 'in-progress' && !task.deletedAt).length === 3,
+          String(savedTasks.filter((task) => task.columnId === 'in-progress' && !task.deletedAt).length));
       } else {
-        check('persist: доска записана', false, 'нет kanbanAPI');
+        check('persist: пространство записано', false, 'нет kanbanAPI или битый файл');
       }
 
       // Колонки: добавление и удаление
@@ -3106,7 +3345,7 @@
         Math.abs(addColH - (window.innerHeight - 96)) < 60,
         `${addColStyle.position}/${Math.round(addColH)} vs ${window.innerHeight - 96}`);
 
-      // Темы: селект переключает оформление, тема хранится в доске.
+      // Темы: селект переключает оформление, тема единая на все доски.
       const styleOf = () => window.getComputedStyle(document.body);
       const kraftLook = styleOf().backgroundImage + '|' + styleOf().backgroundColor;
       check('theme: по умолчанию крафт',
@@ -3122,12 +3361,88 @@
       const graphiteLook = styleOf().backgroundImage + '|' + styleOf().backgroundColor;
       check('theme: графит выглядит иначе, чем крафт', kraftLook !== graphiteLook,
         `${kraftLook.slice(0, 60)} vs ${graphiteLook.slice(0, 60)}`);
-      check('theme: тема в снимке доски', store.snapshot().theme === store.getTheme(), store.snapshot().theme);
+      check('theme: тема глобальная, в снимке доски её нет',
+        !('theme' in store.snapshot()) && store.getTheme() === document.documentElement.dataset.theme,
+        `theme=${store.getTheme()}`);
       const badTheme = store.setTheme('бархат');
       check('theme: мусор отклоняется', !badTheme.ok && store.getTheme() !== 'бархат');
       // Возвращаем крафт, чтобы скриншот остался привычным.
       dom.themeSelect.value = 'kraft';
       dom.themeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Доски: закладки, создание, переключение, переименование, удаление.
+      const tabNodes = () => [...dom.boardsList.querySelectorAll(':scope > .board-tab')];
+      check('boards: одна закладка «Моя доска»',
+        tabNodes().length === 1 && store.listBoards()[0].name === 'Моя доска',
+        String(tabNodes().length));
+      check('boards: активная подсвечена',
+        Boolean(dom.boardsList.querySelector('.board-tab.active')));
+      check('boards: вкладка «Моя доска», счётчик только открытых',
+        tabNodes()[0].querySelector('.board-tab-name').textContent === 'Моя доска' &&
+        tabNodes()[0].querySelector('.board-tab-count').textContent === String(store.listBoards()[0].taskCount) &&
+        tabNodes()[0].title.includes(`открытых: ${store.listBoards()[0].taskCount}`),
+        `${tabNodes()[0].textContent}|${tabNodes()[0].title}`);
+      // Завершённые в счётчик не входят: проба pool → done возвращает счётчик.
+      const openBefore = store.listBoards()[0].taskCount;
+      const probe = store.createTask({ columnId: 'pool', text: 'Проба счётчика' });
+      render();
+      const openAfterCreate = store.listBoards()[0].taskCount;
+      if (probe.ok) store.moveTask(probe.task.id, 'done', {});
+      render();
+      check('boards: завершённые не считаются',
+        probe.ok && openAfterCreate === openBefore + 1 &&
+        store.listBoards()[0].taskCount === openBefore,
+        `${openBefore}->${openAfterCreate}->${store.listBoards()[0].taskCount}`);
+      if (probe.ok) store.deleteTask(probe.task.id);
+      const firstBoardId = store.activeBoardId();
+
+      // Создание через кнопку: новая пустая доска сразу активна + inline-rename.
+      dom.addBoardBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      const secondId = store.activeBoardId();
+      check('boards: доска создана и активна',
+        tabNodes().length === 2 && secondId !== firstBoardId,
+        `${tabNodes().length} ${secondId !== firstBoardId}`);
+      check('boards: новая доска пустая', store.view().stats.total === 0);
+      const renameInput = dom.confirmPop.querySelector('.board-tab-rename');
+      check('boards: переименование сразу открыто', Boolean(renameInput) && !dom.confirmPop.hidden);
+      if (renameInput) {
+        renameInput.value = 'Проект Б';
+        renameInput.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' }));
+      }
+      check('boards: имя применено', store.listBoards().some((entry) => entry.name === 'Проект Б'));
+
+      // Изоляция: стикер второй доски не виден на первой.
+      const created2 = store.createTask({ columnId: 'pool', text: 'Стикер второй доски' });
+      check('boards: стикер создан на второй', created2.ok && store.view().stats.total === 1);
+      render();
+      const firstTab = dom.boardsList.querySelector(`:scope > .board-tab[data-board-id="${firstBoardId}"]`);
+      firstTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      check('boards: переключились кликом по вкладке', store.activeBoardId() === firstBoardId);
+      check('boards: чужих стикеров нет', store.view().stats.total >= 6 && !store.getTask(created2.task.id));
+
+      // Поиск сбрасывается при переключении.
+      dom.searchInput.value = 'вики';
+      dom.searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+      const secondTab = dom.boardsList.querySelector(`:scope > .board-tab[data-board-id="${secondId}"]`);
+      secondTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      check('boards: поиск сброшен при переключении',
+        dom.searchInput.value === '' && store.query === '');
+
+      // Удаление через контекстное меню: правый клик → «Удалить» → «Да, удалить».
+      const doomed = store.activeBoardId();
+      const doomedTab = dom.boardsList.querySelector(`:scope > .board-tab[data-board-id="${doomed}"]`);
+      doomedTab.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      const delBtn = [...dom.confirmPop.querySelectorAll('button')]
+        .find((btn) => btn.textContent === 'Удалить доску');
+      check('boards: меню доски открыто', Boolean(delBtn));
+      if (delBtn) delBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      const yesBtn = [...dom.confirmPop.querySelectorAll('button')]
+        .find((btn) => btn.textContent === 'Да, удалить');
+      check('boards: подтверждение удаления показано', Boolean(yesBtn));
+      if (yesBtn) yesBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      check('boards: доска удалена, активна первая',
+        store.listBoards().length === 1 && store.activeBoardId() === firstBoardId,
+        `${store.listBoards().length} ${store.activeBoardId() === firstBoardId}`);
 
       render();
     } catch (error) {

@@ -253,10 +253,131 @@ body::before {
   flex: 1;
   display: flex;
   gap: 14px;
-  padding: 4px 22px 18px;
+  padding: 4px 22px 18px 8px;
   overflow: auto;
   scroll-behavior: smooth;
   position: relative;
+}
+
+/* --- Вкладки досок: цепляются к левому краю окна, без панели ----------------
+   Никакой карточки-обёртки (именно она читалась «ещё одной колонкой»):
+   ярлыки сидят прямо на краю, скругление только со стороны контента.
+   Активная — бумажным листом, сливается с рабочей областью. */
+.board-tabs {
+  flex: none;
+  width: 38px;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: -8px;
+  margin-right: -10px;
+  padding: 12px 4px 12px 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.boards-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  align-items: flex-start;
+}
+
+.board-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  width: 34px;
+  min-height: 96px;
+  max-height: 190px;
+  padding: 10px 0;
+  border: none;
+  border-radius: 0 10px 10px 0;
+  background: transparent;
+  color: var(--ink-soft);
+  /* Корешок сверху вниз, без transform: поворот через transform мылит
+     растеризацию шрифта, а голый vertical-rl остаётся чётким. */
+  writing-mode: vertical-rl;
+  font-family: var(--font-hand);
+  font-size: 17px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background var(--speed-med) var(--ease-out), color var(--speed-med) var(--ease-out);
+}
+
+.board-tab:hover { background: var(--lane-hover); color: var(--ink); }
+/* Активная выделяется ЦВЕТОМ, не жирностью: бумага текущей темы
+   (var(--paper) — светлая/тёмная вместе с темой) + акцентная кромка
+   со стороны контента. Текст всегда var(--ink) — читается везде. */
+.board-tab.active {
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: inset -3px 0 0 var(--accent),
+    2px 3px 10px -4px rgba(66, 57, 38, 0.35);
+}
+
+.board-tab-name {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  letter-spacing: 0.5px;
+}
+
+/* Счётчик — plain-текстом под именем, без пилюли: только число открытых. */
+.board-tab-count {
+  flex: none;
+  padding-top: 6px;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.board-tab.active .board-tab-count {
+  color: var(--ink-soft);
+}
+
+/* Поле переименования: горизонтальная плавающая карточка у вкладки. */
+.board-tab-rename {
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 10px;
+  width: 190px;
+  outline: none;
+  box-shadow: 0 18px 40px -14px rgba(40, 34, 22, 0.55);
+}
+
+.boards-add {
+  flex: none;
+  align-self: center;
+  width: 32px;
+  height: 32px;
+  margin: auto 0 2px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--speed-med) var(--ease-out), background var(--speed-med) var(--ease-out);
+}
+
+.boards-add:hover {
+  color: var(--ink);
+  background: var(--lane-hover);
 }
 
 .board {
@@ -1114,6 +1235,11 @@ html[data-theme='cork'] .ghost-add:hover { border-color: var(--accent); color: v
 html[data-theme='cork'] .add-column { border-color: rgba(247, 236, 215, 0.35); color: #e8d9bd; background: rgba(0, 0, 0, 0.12); }
 html[data-theme='cork'] .add-column:hover { border-color: var(--accent); color: var(--accent); background: rgba(0, 0, 0, 0.2); }
 html[data-theme='cork'] .empty-hint { border-color: rgba(247, 236, 215, 0.3); }
+/* Вкладки досок: в cork --ink светлый, а бумага активной вкладки светлая —
+   текст тёмно-коричневый, иначе не читается. */
+html[data-theme='cork'] .board-tab.active { color: #4a3a22; }
+html[data-theme='cork'] .board-tab.active .board-tab-count { color: #7a6547; }
+html[data-theme='cork'] .board-tab-rename { color: #4a3a22; }
 
 /* Графит: тёмная спокойная тема для вечера. */
 html[data-theme='graphite'] {
