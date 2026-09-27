@@ -3377,6 +3377,14 @@
         String(tabNodes().length));
       check('boards: активная подсвечена',
         Boolean(dom.boardsList.querySelector('.board-tab.active')));
+      // Вкладки закреплены: rail вне скролла доски, прокрутка не сдвигает ярлык.
+      check('boards: вкладки вне скролла доски', !dom.boardWrap.contains(dom.boardsList));
+      const tabTopBefore = tabNodes()[0].getBoundingClientRect().top;
+      dom.boardWrap.scrollTop = 300;
+      check('boards: прокрутка не уносит вкладки',
+        Math.abs(tabNodes()[0].getBoundingClientRect().top - tabTopBefore) < 2,
+        `${Math.round(tabTopBefore)}->${Math.round(tabNodes()[0].getBoundingClientRect().top)}`);
+      dom.boardWrap.scrollTop = 0;
       check('boards: вкладка «Моя доска», счётчик только открытых',
         tabNodes()[0].querySelector('.board-tab-name').textContent === 'Моя доска' &&
         tabNodes()[0].querySelector('.board-tab-count').textContent === String(store.listBoards()[0].taskCount) &&

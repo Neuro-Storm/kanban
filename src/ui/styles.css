@@ -251,12 +251,23 @@ body::before {
    Стикер остаётся там, где его бросили, даже на границе дорожек. */
 .board-wrap {
   flex: 1;
+  min-width: 0;
   display: flex;
   gap: 14px;
-  padding: 4px 22px 18px 8px;
+  padding: 4px 22px 18px 4px;
   overflow: auto;
   scroll-behavior: smooth;
   position: relative;
+}
+
+/* --- Сцена: вкладки ВНЕ скролла доски --------------------------------------
+   .board-stage — flex-строка на всё место под топбаром: слева rail вкладок
+   (закреплён, не уезжает при прокрутке), справа .board-wrap (скроллится).
+   Раньше rail лежал внутри скролла и уходил вверх вместе с контентом. */
+.board-stage {
+  flex: 1;
+  display: flex;
+  min-height: 0;
 }
 
 /* --- Вкладки досок: цепляются к левому краю окна, без панели ----------------
@@ -270,8 +281,6 @@ body::before {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-left: -8px;
-  margin-right: -10px;
   padding: 12px 4px 12px 0;
   background: transparent;
   border: none;
