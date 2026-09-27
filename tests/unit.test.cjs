@@ -490,6 +490,59 @@ test('computeReflowX: без дорожек — доля ширины борда
   assert.equal(Core.computeReflowX({ x: NaN, width: 200 }), null);
 });
 
+test('computeReflowX: сужение с overflow — кламп по дорожкам, не по борду', () => {
+  // Широкое окно: борд 1236, done 948..1172, стикер в центре (x=960).
+  // Узкое окно: борд 856, но дорожки упёрлись в min-width — done 904..1116
+  // (вылезает за борд, будет скролл). Старый кламп по борду (max 656)
+  // стаскивал стикер влево с потерей позиции; новый держит 910.
+  const narrowed = Core.computeReflowX({
+    x: 960,
+    width: 200,
+    oldLane: { left: 948, right: 1172 },
+    newLane: { left: 904, right: 1116 },
+    oldBoardWidth: 1236,
+    newBoardWidth: 856,
+    bounds: { min: 0, max: 1116 - 200 },
+  });
+  assert.equal(narrowed, 910);
+  // А без bounds (legacy) — всё ещё режет по борду: тест фиксирует,
+  // что UI обязан передавать bounds.
+  const legacy = Core.computeReflowX({
+    x: 960,
+    width: 200,
+    oldLane: { left: 948, right: 1172 },
+    newLane: { left: 904, right: 1116 },
+    oldBoardWidth: 1236,
+    newBoardWidth: 856,
+  });
+  assert.equal(legacy, 656);
+});
+
+test('computeReflowX: round-trip сужение→расширение восстанавливает x', () => {
+  const lanesWide = { left: 948, right: 1172 };
+  const lanesNarrow = { left: 904, right: 1116 };
+  const down = (x, width, boundsMax) =>
+    Core.computeReflowX({
+      x, width, oldLane: lanesWide, newLane: lanesNarrow,
+      oldBoardWidth: 1236, newBoardWidth: 856, bounds: { min: 0, max: boundsMax },
+    });
+  const up = (x, width, boundsMax) =>
+    Core.computeReflowX({
+      x, width, oldLane: lanesNarrow, newLane: lanesWide,
+      oldBoardWidth: 856, newBoardWidth: 1236, bounds: { min: 0, max: boundsMax },
+    });
+  // Центр magnet-путем — точно.
+  assert.equal(down(960, 200, 1116 - 200), 910);
+  assert.equal(up(910, 200, 1172 - 200), 960);
+  // Пропорциональный путь (узкий стикер, вне допуска центра) — точно туда-обратно.
+  for (const x of [950, 1064]) {
+    const narrowed = down(x, 100, 1116 - 100);
+    assert.ok(narrowed >= 904 && narrowed <= 1016, `x=${x}: сужение держит в дорожке (${narrowed})`);
+    const back = up(narrowed, 100, 1172 - 100);
+    assert.equal(back, x, `x=${x}: возврат дал ${back}`);
+  }
+});
+
 test('removeColumn: непустая удаляется, стикеры остаются на месте', () => {
   const { store } = makeStore();
   const added = store.addColumn('Временная');

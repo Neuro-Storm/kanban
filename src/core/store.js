@@ -393,7 +393,11 @@
   // СВОЕЙ дорожки (по columnId, не по центру — иначе съезжает в соседа).
   //  - центр-снапнутые (|x − oldCenter| <= centerTol) встают в новый центр;
   //  - остальные едут пропорционально внутри своей дорожки;
-  //  - без дорожек — долей ширины борда; итог клампится в [0, maxX].
+  //  - без дорожек — долей ширины борда.
+  // Кламп — в пространстве ДОРОЖЕК (opts.bounds {min,max}), а не борда:
+  // в узком окне дорожки упираются в min-width и вылезают за ширину .board
+  // (горизонтальный скролл), и кламп по борду насильно стаскивал бы правые
+  // стикеры влево с потерей позиции. Без bounds — legacy по ширине борда.
   // ---------------------------------------------------------------------
 
   function computeReflowX(input) {
@@ -407,29 +411,37 @@
       Number.isFinite(opts.oldBoardWidth) && opts.oldBoardWidth > 0 ? opts.oldBoardWidth : 0;
     const newBoardWidth =
       Number.isFinite(opts.newBoardWidth) && opts.newBoardWidth > 0 ? opts.newBoardWidth : 0;
-    const clamp01 = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+    const bounds = opts.bounds || null;
 
     if (!Number.isFinite(x)) return null;
-    const maxX = newBoardWidth > 0 ? Math.max(0, newBoardWidth - width) : Infinity;
+    // Границы клампа: явно переданные дорожки важнее ширины борда.
+    let lo = 0;
+    let hi = Infinity;
+    if (bounds && (Number.isFinite(bounds.min) || Number.isFinite(bounds.max))) {
+      if (Number.isFinite(bounds.min)) lo = bounds.min;
+      hi = Number.isFinite(bounds.max) ? Math.max(lo, bounds.max) : Infinity;
+    } else if (newBoardWidth > 0) {
+      hi = Math.max(0, newBoardWidth - width);
+    }
+    const clamp = (value) => Math.max(lo, Math.min(hi, Math.round(value)));
 
     if (oldLane && newLane) {
       const oldWidth = oldLane.right - oldLane.left;
       const newWidth = newLane.right - newLane.left;
       const oldCenter = (oldLane.left + oldLane.right) / 2 - width / 2;
       if (Math.abs(x - oldCenter) <= centerTol) {
-        return clamp01(Math.round((newLane.left + newLane.right) / 2 - width / 2), 0, maxX);
+        return clamp((newLane.left + newLane.right) / 2 - width / 2);
       }
       if (oldWidth > 0 && newWidth > 0) {
         const ratio = (x - oldLane.left) / oldWidth;
-        return clamp01(Math.round(newLane.left + ratio * newWidth), 0, maxX);
+        return clamp(newLane.left + ratio * newWidth);
       }
-      const newCenter = Math.round((newLane.left + newLane.right) / 2 - width / 2);
-      return clamp01(newCenter, 0, maxX);
+      return clamp((newLane.left + newLane.right) / 2 - width / 2);
     }
     if (oldBoardWidth > 0 && newBoardWidth > 0) {
-      return clamp01(Math.round((x / oldBoardWidth) * newBoardWidth), 0, maxX);
+      return clamp((x / oldBoardWidth) * newBoardWidth);
     }
-    return clamp01(Math.round(x), 0, maxX === Infinity ? Math.round(x) : maxX);
+    return clamp(x);
   }
 
   // ---------------------------------------------------------------------

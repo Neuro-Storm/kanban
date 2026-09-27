@@ -460,6 +460,15 @@
     if (!oldGeom || !newGeom || !oldGeom.lanes.length || !newGeom.lanes.length) return 0;
     const oldById = new Map(oldGeom.lanes.map((lane) => [lane.id, lane]));
     const newById = new Map(newGeom.lanes.map((lane) => [lane.id, lane]));
+    // Границы клампа — крайние грани НОВЫХ дорожек, а не ширина борда:
+    // в узком окне дорожки вылезают за .board (скролл), и кламп по борду
+    // стаскивал бы правые стикеры влево с потерей позиции.
+    let laneMin = Infinity;
+    let laneMax = -Infinity;
+    for (const lane of newGeom.lanes) {
+      if (lane.left < laneMin) laneMin = lane.left;
+      if (lane.right > laneMax) laneMax = lane.right;
+    }
     let snapshot = null;
     try {
       snapshot = store.snapshot();
@@ -482,6 +491,7 @@
         newLane,
         oldBoardWidth: oldGeom.boardWidth,
         newBoardWidth: newGeom.boardWidth,
+        bounds: { min: laneMin, max: laneMax - width },
         centerTol: SNAP_CENTER_PX + 2,
       });
       if (nextX !== null && nextX !== task.x) {
@@ -1395,7 +1405,10 @@
     }
   });
 
-  dom.board.addEventListener('pointerdown', onPointerDown);
+  // pointerdown слушаем на обёртке, а не на доске: рамка выделения
+  // и клик-создание должны начинаться из любой точки (включая края-паддинги
+  // .board-wrap), кроме стикеров. События с доски добубливают наверх как раньше.
+  dom.boardWrap.addEventListener('pointerdown', onPointerDown);
   window.addEventListener('pointermove', onPointerMove, { passive: false });
   window.addEventListener('pointerup', onPointerUp);
   window.addEventListener('pointercancel', () => {
@@ -2572,12 +2585,76 @@
       check('reflow: без дорожек — доля борда',
         Core.computeReflowX({ x: 50, width: 200, oldBoardWidth: 1000, newBoardWidth: 2000 }) === 100);
 
-      // Живой рефлоу narrow→wide: точный сценарий «растянули окно во весь экран».
+      // Живой рефлоу narrow→wide: сценарии «сузили окно, расширили обратно».
       // Уводим задачи в суженную геометрию, затем идём штатным путём ресайза
       // обратно и проверяем инвариант: центр каждого стикера — в своей колонке.
+      // Сценарий 2 — overflow: дорожки упёрлись в min-width 212px и вылезают
+      // за борд (горизонтальный скролл). Именно его ломал кламп по ширине борда.
       render();
       const wideGeom = currentGeom();
-      const narrowGeom = {
+      const snapshotX = () => {
+        const map = new Map();
+        for (const task of store.snapshot().tasks) {
+          if (task.deletedAt === null && Number.isFinite(task.x)) map.set(task.id, task.x);
+        }
+        return map;
+      };
+      // Зеркало reflowBoardPositions: те же bounds из граней новых дорожек.
+      const shiftToGeom = (fromGeom, toGeom) => {
+        let laneMin = Infinity;
+        let laneMax = -Infinity;
+        for (const lane of toGeom.lanes) {
+          if (lane.left < laneMin) laneMin = lane.left;
+          if (lane.right > laneMax) laneMax = lane.right;
+        }
+        const items = [];
+        for (const task of store.snapshot().tasks) {
+          if (task.deletedAt === null && Number.isFinite(task.x)) {
+            const oldLane = fromGeom.lanes.find((entry) => entry.id === task.columnId) || null;
+            const newLane = toGeom.lanes.find((entry) => entry.id === task.columnId) || null;
+            if (!newLane) continue;
+            const target = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
+            const w = target ? target.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
+            const nx = Core.computeReflowX({
+              x: task.x, width: w, oldLane, newLane,
+              oldBoardWidth: fromGeom.boardWidth, newBoardWidth: toGeom.boardWidth,
+              bounds: { min: laneMin, max: laneMax - w },
+              centerTol: SNAP_CENTER_PX + 2,
+            });
+            if (nx !== null && nx !== task.x) items.push({ id: task.id, x: nx });
+          }
+        }
+        if (items.length) store.updatePositionsBatch(items);
+        render();
+      };
+      const verifyOwnLanes = (wideX, label) => {
+        let misplaced = 0;
+        let drifted = 0;
+        for (const [id, x] of wideX) {
+          const after = store.getTask(id);
+          if (!after) {
+            drifted += 1;
+            continue;
+          }
+          const ownLane = wideGeom.lanes.find((entry) => entry.id === after.columnId);
+          const ownCenter = ownLane ? Math.round((ownLane.left + ownLane.right) / 2 - STICKER_WIDTH / 2) : null;
+          // Допустимо: вернулся в исходный x (±1 округление) либо легитимно
+          // дощёлкнулся в центр своей дорожки (центр-магнит рефлоу).
+          if (Math.abs(after.x - x) > 1 && (ownCenter === null || Math.abs(after.x - ownCenter) > 2)) {
+            drifted += 1;
+          }
+          const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
+          if (node) {
+            const left = Number.parseFloat(node.style.left || '0') || 0;
+            const center = left + (node.offsetWidth || STICKER_WIDTH) / 2;
+            if (columnIdAtBoardX(center) !== after.columnId) misplaced += 1;
+          }
+        }
+        check(`reflow: ${label} — x на месте или в центре своей дорожки`, drifted === 0, `уплыло: ${drifted}`);
+        check(`reflow: ${label} — все стикеры в своих дорожках`, misplaced === 0, `мимо: ${misplaced}`);
+      };
+      // Сценарий 1: равномерное сужение (пропорция).
+      const scaledGeom = {
         boardWidth: Math.round(wideGeom.boardWidth * 0.6),
         lanes: wideGeom.lanes.map((lane) => ({
           id: lane.id,
@@ -2585,53 +2662,25 @@
           right: Math.round(lane.left * 0.6 + (lane.right - lane.left) * 0.6),
         })),
       };
-      const wideX = new Map();
-      for (const task of store.snapshot().tasks) {
-        if (task.deletedAt === null && Number.isFinite(task.x)) wideX.set(task.id, task.x);
-      }
-      const toNarrow = [];
-      for (const [id, x] of wideX) {
-        const task = store.getTask(id);
-        const lane = wideGeom.lanes.find((entry) => entry.id === task.columnId);
-        const narrowLane = narrowGeom.lanes.find((entry) => entry.id === task.columnId);
-        if (!lane || !narrowLane) continue;
-        const target = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
-        const w = target ? target.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
-        const nx = Core.computeReflowX({
-          x, width: w, oldLane: lane, newLane: narrowLane,
-          oldBoardWidth: wideGeom.boardWidth, newBoardWidth: narrowGeom.boardWidth,
-          centerTol: SNAP_CENTER_PX + 2,
-        });
-        if (nx !== null) toNarrow.push({ id, x: nx });
-      }
-      store.updatePositionsBatch(toNarrow);
+      const wideXScaled = snapshotX();
+      shiftToGeom(wideGeom, scaledGeom);
+      reflowBoardPositions(scaledGeom, currentGeom());
       render();
-      reflowBoardPositions(narrowGeom, currentGeom());
+      verifyOwnLanes(wideXScaled, 'narrow→wide');
+      // Сценарий 2: overflow через min-width (дорожки шире борда).
+      const overflowGeom = {
+        boardWidth: 700,
+        lanes: wideGeom.lanes.map((lane, index) => ({
+          id: lane.id,
+          left: index * (212 + 14),
+          right: index * (212 + 14) + 212,
+        })),
+      };
+      const wideXOverflow = snapshotX();
+      shiftToGeom(wideGeom, overflowGeom);
+      reflowBoardPositions(overflowGeom, currentGeom());
       render();
-      let misplaced = 0;
-      let drifted = 0;
-      for (const [id, x] of wideX) {
-        const after = store.getTask(id);
-        if (!after) {
-          drifted += 1;
-          continue;
-        }
-        const ownLane = wideGeom.lanes.find((entry) => entry.id === after.columnId);
-        const ownCenter = ownLane ? Math.round((ownLane.left + ownLane.right) / 2 - STICKER_WIDTH / 2) : null;
-        // Допустимо: вернулся в исходный x (±1 округление) либо легитимно
-        // дощёлкнулся в центр своей дорожки (центр-магнит рефлоу).
-        if (Math.abs(after.x - x) > 1 && (ownCenter === null || Math.abs(after.x - ownCenter) > 2)) {
-          drifted += 1;
-        }
-        const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
-        if (node) {
-          const left = Number.parseFloat(node.style.left || '0') || 0;
-          const center = left + (node.offsetWidth || STICKER_WIDTH) / 2;
-          if (columnIdAtBoardX(center) !== after.columnId) misplaced += 1;
-        }
-      }
-      check('reflow: narrow→wide — x на месте или в центре своей дорожки', drifted === 0, `уплыло: ${drifted}`);
-      check('reflow: narrow→wide — все стикеры в своих дорожках', misplaced === 0, `мимо: ${misplaced}`);
+      verifyOwnLanes(wideXOverflow, 'overflow→wide');
 
       // Живое перетаскивание: живой узел движется сам, без призрака и слота.
       // Стикер можно бросить на границе — он остаётся где бросили.
@@ -2812,6 +2861,19 @@
         window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Escape' }));
         check('marquee: Esc очистил', selectedIds.size === 0 &&
           !dom.board.querySelector(':scope > .sticker.selected'));
+
+        // Рамка с самого края: старт в паддинге обёртки (мимо доски),
+        // протяжка внутрь — стикеры выбираются.
+        const eStartX = selBoardRect.left - 10;
+        const eStartY = selBoardRect.top + lane0.top + 60;
+        dispatchPointer('pointerdown', dom.boardWrap, eStartX, eStartY, 91);
+        dispatchPointer('pointermove', window, eStartX + 310, eStartY + 500, 91);
+        check('marquee: рамка с края видна', Boolean(dom.board.querySelector('.marquee')));
+        dispatchPointer('pointerup', window, eStartX + 310, eStartY + 500, 91);
+        check('marquee: рамка с края выбрала стикеры',
+          selectedIds.has('seed-1') && selectedIds.size >= 2,
+          String(selectedIds.size));
+        window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Escape' }));
 
         // Shift+клики собирают пару для группового переноса.
         const seedNode1 = dom.board.querySelector(':scope > .sticker[data-task-id="seed-1"]');
