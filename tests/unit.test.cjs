@@ -179,7 +179,8 @@ test('rich-текст: div превращается в перенос, span де
     Core.sanitizeRich('текст<span style="font-size:21px; color:red" onclick="x()">крупно</span>'),
     'текст<span data-fs="21" style="font-size:21px">крупно</span>'
   );
-  assert.equal(Core.strippedText('<b>Жир</b><br>plain'), 'Жирplain');
+  assert.equal(Core.strippedText('<b>Жир</b><br>plain'), 'Жир\nplain');
+  assert.equal(Core.firstLine('Первая<br>Вторая'), 'Первая');
 });
 
 test('поиск ищет по тексту без учёта разметки', () => {
@@ -815,4 +816,153 @@ test('доски: битое пространство чинится до раб
   for (const entry of boards) {
     assert.match(entry.id, /^[A-Za-z0-9_-]+$/);
   }
+});
+
+test('колонки: кириллический id переживает сохранение и перечитывание', () => {
+  const storage = memoryStorage(null);
+  const store = new Core.KanbanStore({ storage, autosaveMs: 1 });
+  store.init();
+  const added = store.addColumn('Проверка');
+  assert.equal(added.ok, true);
+  assert.equal(added.column.id, 'проверка');
+  const task = store.createTask({ columnId: added.column.id, text: 'Не потеряться' });
+  assert.equal(task.ok, true);
+  store.flushSync();
+
+  const reloaded = new Core.KanbanStore({ storage, autosaveMs: 1 });
+  reloaded.init();
+  const columns = reloaded.snapshot().columns;
+  assert.ok(columns.some((column) => column.id === 'проверка'), 'колонка на месте после reload');
+  const kept = reloaded.getTask(task.task.id);
+  assert.ok(kept, 'стикер на месте после reload');
+  assert.equal(kept.columnId, 'проверка');
+});
+
+test('темы: голубая тема входит в набор и валидна', () => {
+  assert.ok(Core.THEMES.some((theme) => theme.id === 'blue'));
+  const { store } = makeStore();
+  assert.equal(store.setTheme('blue').ok, true);
+  assert.equal(store.getTheme(), 'blue');
+});
+
+test('updatePositionsBatch: батч умеет менять x и y вместе', () => {
+  const { store } = makeStore();
+  const created = store.createTask({ columnId: 'pool', text: 'Переезд', x: 10, y: 20 });
+  const result = store.updatePositionsBatch([{ id: created.task.id, x: 30, y: 400 }]);
+  assert.equal(result.updated, 1);
+  const after = store.getTask(created.task.id);
+  assert.equal(after.x, 30);
+  assert.equal(after.y, 400);
+});
+
+test('flush: правка во время асинхронной записи не теряется', async () => {
+  const initial = {
+    version: 2,
+    activeBoardId: 'b',
+    theme: 'kraft',
+    boards: [{ id: 'b', name: 'Доска', board: { columns: [{ id: 'pool', title: 'Пул' }], tasks: [] } }],
+  };
+  let value = initial;
+  let saves = 0;
+  let resolveFirst = null;
+  const storage = {
+    load: () => value,
+    save: (payload) => {
+      saves += 1;
+      if (saves === 1) {
+        return new Promise((resolve) => {
+          resolveFirst = () => {
+            value = JSON.parse(JSON.stringify(payload));
+            resolve({ ok: true });
+          };
+        });
+      }
+      value = JSON.parse(JSON.stringify(payload));
+      return Promise.resolve({ ok: true });
+    },
+  };
+  const store = new Core.KanbanStore({ storage, autosaveMs: 1 });
+  store.init();
+  const created = store.createTask({ columnId: 'pool', text: 'До правки' });
+  const pending = store.flush();
+  store.updateTask(created.task.id, { text: 'Правка во время записи' });
+  resolveFirst();
+  await pending;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const saved = value.boards[0].board.tasks.find((task) => task.id === created.task.id);
+  assert.equal(saves, 2, 'вторая запись действительно случилась');
+  assert.equal(saved.text, 'Правка во время записи');
+});
+
+test('доски: reorderBoards меняет порядок вкладок', () => {
+  const { store } = makeStore();
+  const first = store.activeBoardId();
+  const second = store.createBoard('Вторая').board.id;
+  const order = store.listBoards().map((entry) => entry.id);
+  assert.deepEqual(order, [first, second]);
+  const result = store.reorderBoards([second, first]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(store.listBoards().map((entry) => entry.id), [second, first]);
+  assert.equal(store.activeBoardId(), second, 'активная доска не меняется');
+  assert.equal(store.reorderBoards([second]).ok, false, 'неполный список отклоняется');
+});
+
+test('доски: transferTasks переносит стикеры в пул целевой доски', () => {
+  const { store } = makeStore();
+  const first = store.activeBoardId();
+  const second = store.createBoard('Вторая').board.id;
+  store.switchBoard(first);
+  const task = store.createTask({ columnId: 'pool', text: 'Переезжает', x: 40, y: 60 });
+  assert.equal(task.ok, true);
+  const result = store.transferTasks([task.task.id], second);
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 1);
+  assert.equal(store.getTask(task.task.id), null, 'на исходной доске стикера больше нет');
+  store.switchBoard(second);
+  const moved = store.getTask(task.task.id);
+  assert.ok(moved);
+  assert.equal(moved.columnId, 'pool');
+  assert.equal(moved.x, null);
+  assert.equal(moved.y, null);
+});
+
+test('доски: перенос с уже открытой целевой доски сохраняет колонку и позицию', () => {
+  const { store } = makeStore();
+  const first = store.activeBoardId();
+  const second = store.createBoard('Вторая').board.id;
+  store.switchBoard(first);
+  const task = store.createTask({ columnId: 'pool', text: 'Через вкладку' });
+  store.switchBoard(second);
+  const result = store.transferTasks([task.task.id], second, {
+    sourceBoardId: first,
+    targetColumnId: 'urgent',
+    x: 123,
+    y: 456,
+  });
+  assert.equal(result.ok, true);
+  const moved = store.getTask(task.task.id);
+  assert.ok(moved);
+  assert.equal(moved.columnId, 'urgent');
+  assert.equal(moved.x, 123);
+  assert.equal(moved.y, 456);
+});
+
+test('layout: геометрия доски сохраняется и перечитывается', () => {
+  const storage = memoryStorage(null);
+  const store = new Core.KanbanStore({ storage, autosaveMs: 1 });
+  store.init();
+  const layout = {
+    boardWidth: 1000,
+    lanes: [
+      { id: 'pool', left: 0, right: 300 },
+      { id: 'in-progress', left: 314, right: 614 },
+    ],
+  };
+  assert.equal(store.setBoardLayout(layout).ok, true);
+  assert.deepEqual(store.getBoardLayout(), layout);
+  store.flushSync();
+
+  const reloaded = new Core.KanbanStore({ storage, autosaveMs: 1 });
+  reloaded.init();
+  assert.deepEqual(reloaded.getBoardLayout(), layout);
 });

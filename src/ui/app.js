@@ -60,11 +60,14 @@
     board: document.getElementById('board'),
     boardWrap: document.querySelector('.board-wrap'),
     boardsList: document.getElementById('boardsList'),
+    boardsScrollUp: document.getElementById('boardsScrollUp'),
+    boardsScrollDown: document.getElementById('boardsScrollDown'),
     addBoardBtn: document.getElementById('addBoardBtn'),
     addColumnBtn: document.getElementById('addColumnBtn'),
     bulkDeleteBtn: document.getElementById('bulkDeleteBtn'),
     exportBtn: document.getElementById('exportBtn'),
     importBtn: document.getElementById('importBtn'),
+    arrangeBtn: document.getElementById('arrangeBtn'),
     themeSelect: document.getElementById('themeSelect'),
     searchInput: document.getElementById('searchInput'),
     searchBox: document.querySelector('.search'),
@@ -142,6 +145,110 @@
   function readRichText(el) {
     if (!el) return '';
     return Core.sanitizeRich(el.innerHTML || '');
+  }
+
+  function setCaretToEnd(root) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(root);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch (error) {
+      /* просто фокус */
+    }
+  }
+
+  // Своя история для contenteditable: Ctrl+Z/Ctrl+Y должны возвращать
+  // состояние текста, а не зависеть от того, как Chromium смешал undo
+  // после execCommand, вставки и переключения contentEditable.
+  function createTextHistory(root) {
+    const states = [root.innerHTML || ''];
+    let index = 0;
+    let timer = null;
+
+    const snapshot = () => {
+      const html = root.innerHTML || '';
+      if (html === states[index]) return;
+      states.splice(index + 1);
+      states.push(html);
+      if (states.length > 120) states.shift();
+      index = states.length - 1;
+    };
+    const flush = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      snapshot();
+    };
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        snapshot();
+      }, 320);
+    };
+    const restore = (html) => {
+      root.innerHTML = html;
+      root.focus();
+      setCaretToEnd(root);
+    };
+
+    return {
+      snapshot,
+      schedule,
+      flush,
+      undo() {
+        flush();
+        if (index <= 0) return false;
+        index -= 1;
+        restore(states[index]);
+        return true;
+      },
+      redo() {
+        flush();
+        if (index >= states.length - 1) return false;
+        index += 1;
+        restore(states[index]);
+        return true;
+      },
+      destroy() {
+        if (timer) clearTimeout(timer);
+        timer = null;
+      },
+    };
+  }
+
+  function attachTextHistory(root, history) {
+    const onKeyDown = (event) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = String(event.key || '').toLowerCase();
+      if (key === 'z') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.shiftKey) history.redo();
+        else history.undo();
+      } else if (key === 'y') {
+        event.preventDefault();
+        event.stopPropagation();
+        history.redo();
+      }
+    };
+    const onInput = () => history.schedule();
+    const onBlur = () => history.flush();
+    root.addEventListener('keydown', onKeyDown, true);
+    root.addEventListener('input', onInput);
+    root.addEventListener('blur', onBlur);
+    root._textHistory = history;
+    return () => {
+      root.removeEventListener('keydown', onKeyDown, true);
+      root.removeEventListener('input', onInput);
+      root.removeEventListener('blur', onBlur);
+      if (root._textHistory === history) delete root._textHistory;
+      history.destroy();
+    };
   }
 
   // Ощутимый магнит: сетка 8px + края/центр дорожек + края соседних стикеров.
@@ -315,6 +422,71 @@
     drag.pushed = null;
   }
 
+  // Стикер вырос (допечатали строку) — нижние не должны оказаться под ним.
+  // Верхний стикер остаётся на месте, всё, что пересекается, съезжает вниз
+  // каскадом. commit=false — живой предпросмотр во время набора (DOM only),
+  // commit=true — запись новых y в store (батчем, без спама рендеров).
+  let settleGuard = false;
+  let settleRequested = false;
+  function settleOverlaps(options) {
+    const commit = !options || options.commit !== false;
+    if (drag.active || settleGuard || editorNode) return 0;
+    const entries = [];
+    for (const node of dom.board.querySelectorAll(':scope > .sticker:not(.is-draft)')) {
+      const left = Number.parseFloat(node.style.left || '0') || 0;
+      const top = Number.parseFloat(node.style.top || '0') || 0;
+      entries.push({
+        id: node.dataset.taskId,
+        node,
+        left,
+        top,
+        width: node.offsetWidth || STICKER_WIDTH,
+        height: node.offsetHeight || 110,
+      });
+    }
+    if (entries.length < 2) return 0;
+    entries.sort((a, b) => a.top - b.top || a.left - b.left);
+    const placed = [];
+    const moves = new Map();
+    for (const entry of entries) {
+      let top = entry.top;
+      let rect = {
+        left: entry.left,
+        top,
+        right: entry.left + entry.width,
+        bottom: top + entry.height,
+      };
+      let guard = 0;
+      let hit = placed.filter((other) => rectsOverlap(rect, other));
+      while (hit.length && guard < entries.length + 2) {
+        top = Math.max(...hit.map((other) => other.bottom)) + STICKER_GAP;
+        rect = { left: entry.left, top, right: entry.left + entry.width, bottom: top + entry.height };
+        hit = placed.filter((other) => rectsOverlap(rect, other));
+        guard += 1;
+      }
+      placed.push(rect);
+      if (top !== entry.top) moves.set(entry.id, { x: entry.left, y: Math.round(top) });
+    }
+    if (!moves.size) return 0;
+    for (const [id, pos] of moves) {
+      const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
+      if (!node) continue;
+      node.style.top = `${pos.y}px`;
+      if (commit) markReflowed(node);
+    }
+    if (commit) {
+      settleGuard = true;
+      try {
+        store.updatePositionsBatch([...moves].map(([id, pos]) => ({ id, x: pos.x, y: pos.y })));
+      } finally {
+        settleGuard = false;
+      }
+    } else {
+      fitBoardToContent();
+    }
+    return moves.size;
+  }
+
   // Board-relative координаты точки клиента.
   function boardCoords(clientX, clientY) {
     const rect = dom.board.getBoundingClientRect();
@@ -437,9 +609,31 @@
     return { boardWidth: boardRect.width, lanes: measureLanes() };
   }
 
+  function geomToLayout(geom) {
+    if (!geom || !geom.lanes || !geom.lanes.length) return null;
+    return {
+      boardWidth: Math.round(geom.boardWidth || 0),
+      lanes: geom.lanes.map((lane) => ({
+        id: lane.id,
+        left: Math.round(lane.left),
+        right: Math.round(lane.right),
+      })),
+    };
+  }
+
+  // Сохраняем геометрию у активной доски. При следующем открытии (в том
+  // числе после смены масштаба/размера окна) по ней пересчитаем X стикеров.
   function snapshotGeom() {
     lastGeom = currentGeom();
+    store.setBoardLayout(geomToLayout(lastGeom));
     return lastGeom;
+  }
+
+  // Пересчитать стикеры по сохранённой геометрии этой доски.
+  function applyStoredLayout() {
+    const stored = store.getBoardLayout();
+    if (!stored) return 0;
+    return reflowBoardPositions(stored, currentGeom());
   }
 
   // Плавность рефлоу: вешаем .reflow на сдвинутые узлы, снимаем пачкой
@@ -531,6 +725,24 @@
       const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
       const width = node ? node.offsetWidth || STICKER_WIDTH : STICKER_WIDTH;
       const centerX = (lane.left + lane.right) / 2 - width / 2;
+      const stickerCenter = task.x + width / 2;
+      // Стикер вылез из своей дорожки (например, файл сохранили в другом
+      // масштабе, а геометрии ещё нет) — мягко возвращаем его внутрь.
+      if (stickerCenter < lane.left - 7 || stickerCenter >= lane.right + 7) {
+        const minX = lane.left + 8;
+        const maxX = lane.right - width - 8;
+        const clamped = Math.round(
+          maxX >= minX ? Math.max(minX, Math.min(maxX, task.x)) : centerX
+        );
+        if (clamped !== task.x) {
+          items.push({ id: task.id, x: clamped });
+          if (node) {
+            node.style.left = `${clamped}px`;
+            markReflowed(node);
+          }
+        }
+        continue;
+      }
       if (Math.abs(task.x - centerX) <= SNAP_CENTER_PX + 2 && task.x !== Math.round(centerX)) {
         items.push({ id: task.id, x: Math.round(centerX) });
         if (node) {
@@ -678,6 +890,10 @@
     }
     lastRendered = view;
     refreshSaveStatus();
+    if (settleRequested && !drag.active) {
+      settleRequested = false;
+      settleOverlaps({ commit: true });
+    }
     fitBoardToContent();
     updateBulkBar();
     if (scroller.scrollLeft !== scrollLeft) scroller.scrollLeft = scrollLeft;
@@ -781,6 +997,8 @@
     pointerType: 'mouse',
     startClientX: 0,
     startClientY: 0,
+    lastClientX: 0,
+    lastClientY: 0,
     grabDX: 0,
     grabDY: 0,
     origX: 0,
@@ -793,6 +1011,10 @@
     targetBlocked: false,
     pushed: null,
     group: null,
+    overBoardId: null,
+    sourceBoardId: null,
+    hoverTimer: null,
+    hoverBoardId: null,
   };
 
   const bgClick = {
@@ -801,6 +1023,22 @@
     startClientY: 0,
     boardX: 0,
     boardY: 0,
+  };
+
+  // Панорамирование доски средней кнопкой мыши.
+  const pan = {
+    active: false,
+    pointerId: null,
+    startX: 0,
+    startY: 0,
+    scrollLeft: 0,
+    scrollTop: 0,
+  };
+
+  // Автопрокрутка рейла вкладок, когда стикер подводят к его краю.
+  const railScroll = {
+    raf: null,
+    dir: 0,
   };
 
   // Выбранные стикеры для групповых операций (перенос/удаление).
@@ -834,10 +1072,47 @@
     node: null,
     textEl: null,
     originalText: '',
+    history: null,
+    detachHistory: null,
+    onInput: null,
   };
 
   function dragTolerance(pointerType) {
     return pointerType === 'touch' ? 12 : 5;
+  }
+
+  function beginPan(event) {
+    if (event.button !== 1 || !dom.boardWrap) return;
+    event.preventDefault();
+    pan.active = true;
+    pan.pointerId = event.pointerId;
+    pan.startX = event.clientX;
+    pan.startY = event.clientY;
+    pan.scrollLeft = dom.boardWrap.scrollLeft;
+    pan.scrollTop = dom.boardWrap.scrollTop;
+    dom.boardWrap.classList.add('panning');
+    document.body.classList.add('panning-active');
+    try {
+      dom.boardWrap.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* синтетические события в тестах */
+    }
+  }
+
+  function endPan() {
+    if (!pan.active) return;
+    const pointerId = pan.pointerId;
+    pan.active = false;
+    pan.pointerId = null;
+    if (dom.boardWrap) {
+      dom.boardWrap.classList.remove('panning');
+      try {
+        dom.boardWrap.releasePointerCapture(pointerId);
+      } catch (error) {
+        /* pointer уже отпущен */
+      }
+    }
+    document.body.classList.remove('panning-active');
   }
 
   function isInteractiveTarget(target) {
@@ -924,12 +1199,19 @@
     commitInlineEdit();
     hideFormatPop();
     drag.active = true;
+    drag.sourceBoardId = store.activeBoardId();
+    drag.lastClientX = drag.startClientX;
+    drag.lastClientY = drag.startClientY;
+    clearHoverSwitch();
+    stopRailAutoScroll();
     drag.origX = Number.parseFloat(drag.node.style.left || '0') || 0;
     drag.origY = Number.parseFloat(drag.node.style.top || '0') || 0;
     drag.origColumnId = drag.node.dataset.columnId || null;
     drag.lanes = measureLanes();
     drag.targetColumnId = drag.origColumnId;
     drag.targetBlocked = false;
+    drag.overBoardId = null;
+    clearBoardTabHighlight();
     // Группа: тянем всё выделение целиком, со сдвигом относительно ведущего.
     drag.group = null;
     if (selectedIds.size > 1 && selectedIds.has(drag.taskId)) {
@@ -970,6 +1252,197 @@
 
   function stickerCenterX(boardX) {
     return boardX - drag.grabDX + STICKER_WIDTH / 2;
+  }
+
+  function boardTabAtPoint(clientX, clientY) {
+    if (!dom.boardsList) return null;
+    for (const tab of dom.boardsList.querySelectorAll(':scope > .board-tab')) {
+      const rect = tab.getBoundingClientRect();
+      if (
+        clientX >= rect.left &&
+        clientX <= rect.right &&
+        clientY >= rect.top &&
+        clientY <= rect.bottom
+      ) {
+        return tab.dataset.boardId || null;
+      }
+    }
+    return null;
+  }
+
+  function highlightBoardTab(boardId) {
+    if (!dom.boardsList) return;
+    for (const tab of dom.boardsList.querySelectorAll(':scope > .board-tab')) {
+      tab.classList.toggle('board-drop-target', tab.dataset.boardId === boardId);
+    }
+  }
+
+  function clearBoardTabHighlight() {
+    if (!dom.boardsList) return;
+    for (const tab of dom.boardsList.querySelectorAll(':scope > .board-tab')) {
+      tab.classList.remove('board-drop-target');
+    }
+  }
+
+  function clearHoverSwitch() {
+    if (drag.hoverTimer) clearTimeout(drag.hoverTimer);
+    drag.hoverTimer = null;
+    drag.hoverBoardId = null;
+  }
+
+  // Подержал стикер над чужой вкладкой — переключаем доску, не отпуская
+  // стикер. Дальше его можно поставить в любое место новой доски.
+  function scheduleHoverSwitch(boardId) {
+    if (!drag.active || !boardId || boardId === store.activeBoardId()) {
+      clearHoverSwitch();
+      return;
+    }
+    if (drag.group && drag.group.length > 1) {
+      clearHoverSwitch();
+      return;
+    }
+    if (drag.hoverBoardId === boardId && drag.hoverTimer) return;
+    clearHoverSwitch();
+    drag.hoverBoardId = boardId;
+    drag.hoverTimer = setTimeout(() => {
+      drag.hoverTimer = null;
+      const target = drag.hoverBoardId;
+      drag.hoverBoardId = null;
+      if (!drag.active || !drag.node || !target) return;
+      if (target === store.activeBoardId()) return;
+      if (drag.group && drag.group.length > 1) return;
+      switchBoardDuringDrag(target);
+    }, 420);
+  }
+
+  function switchBoardDuringDrag(boardId) {
+    if (!drag.active || !drag.node) return;
+    if (!drag.sourceBoardId) drag.sourceBoardId = store.activeBoardId();
+    drag.overBoardId = null;
+    clearBoardTabHighlight();
+    clearHoverSwitch();
+    switchToBoard(boardId);
+    drag.lanes = measureLanes();
+    drag.targetColumnId = null;
+    drag.targetBlocked = false;
+    // Пересчитываем позицию уже на геометрии новой доски.
+    if (Number.isFinite(drag.lastClientX)) {
+      moveDrag(drag.lastClientX, drag.lastClientY);
+    }
+  }
+
+  function updateBoardScrollButtons() {
+    if (!dom.boardsList) return;
+    const max = dom.boardsList.scrollHeight - dom.boardsList.clientHeight;
+    const hasOverflow = max > 1;
+    const atTop = dom.boardsList.scrollTop <= 1;
+    const atBottom = dom.boardsList.scrollTop >= max - 1;
+    if (dom.boardsScrollUp) dom.boardsScrollUp.hidden = !hasOverflow || atTop;
+    if (dom.boardsScrollDown) dom.boardsScrollDown.hidden = !hasOverflow || atBottom;
+  }
+
+  function scrollBoardsStep(delta) {
+    if (!dom.boardsList) return false;
+    const max = dom.boardsList.scrollHeight - dom.boardsList.clientHeight;
+    if (max <= 0) return false;
+    const before = dom.boardsList.scrollTop;
+    dom.boardsList.scrollTop = Math.max(0, Math.min(max, before + delta));
+    updateBoardScrollButtons();
+    return dom.boardsList.scrollTop !== before;
+  }
+
+  function holdBoardScrollButton(button, delta) {
+    if (!button) return;
+    let delay = null;
+    let repeat = null;
+    const stop = () => {
+      if (delay) clearTimeout(delay);
+      if (repeat) clearInterval(repeat);
+      delay = null;
+      repeat = null;
+    };
+    button.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      stop();
+      scrollBoardsStep(delta);
+      delay = setTimeout(() => {
+        repeat = setInterval(() => {
+          if (!scrollBoardsStep(delta)) stop();
+        }, 80);
+      }, 300);
+    });
+    window.addEventListener('pointerup', stop);
+    button.addEventListener('pointercancel', stop);
+    button.addEventListener('pointerleave', stop);
+  }
+
+  function refreshBoardHover() {
+    if (!drag.active) return;
+    const over = boardTabAtPoint(drag.lastClientX, drag.lastClientY);
+    drag.overBoardId = over && over !== store.activeBoardId() ? over : null;
+    if (drag.overBoardId) {
+      highlightBoardTab(drag.overBoardId);
+      // Пока рейл сам прокручивается, не переключаем доски под курсором:
+      // сначала даём добраться до нужной вкладки.
+      if (railScroll.raf) clearHoverSwitch();
+      else scheduleHoverSwitch(drag.overBoardId);
+    } else {
+      clearBoardTabHighlight();
+      clearHoverSwitch();
+    }
+  }
+
+  function stopRailAutoScroll() {
+    if (railScroll.raf) cancelAnimationFrame(railScroll.raf);
+    railScroll.raf = null;
+    railScroll.dir = 0;
+  }
+
+  function updateRailAutoScroll(clientX, clientY) {
+    if (!drag.active || !dom.boardsList) {
+      stopRailAutoScroll();
+      return;
+    }
+    const listRect = dom.boardsList.getBoundingClientRect();
+    const rail = dom.boardsList.closest('.board-tabs');
+    const railRect = rail ? rail.getBoundingClientRect() : listRect;
+    const nearRail =
+      clientX >= railRect.left - 8 && clientX <= railRect.right + 22;
+    let dir = 0;
+    if (nearRail && clientY >= listRect.top - 8 && clientY < listRect.top + 54) dir = -1;
+    else if (nearRail && clientY > listRect.bottom - 54 && clientY <= listRect.bottom + 8) dir = 1;
+    if (!dir) {
+      stopRailAutoScroll();
+      return;
+    }
+    const max = dom.boardsList.scrollHeight - dom.boardsList.clientHeight;
+    if (max <= 0) {
+      stopRailAutoScroll();
+      return;
+    }
+    if (railScroll.raf && railScroll.dir === dir) return;
+    stopRailAutoScroll();
+    railScroll.dir = dir;
+    const tick = () => {
+      if (!drag.active || !railScroll.dir || !dom.boardsList) {
+        railScroll.raf = null;
+        return;
+      }
+      const maxNow = dom.boardsList.scrollHeight - dom.boardsList.clientHeight;
+      const before = dom.boardsList.scrollTop;
+      const next = Math.max(0, Math.min(maxNow, before + railScroll.dir * 8));
+      if (next === before) {
+        railScroll.raf = null;
+        railScroll.dir = 0;
+        refreshBoardHover();
+        return;
+      }
+      dom.boardsList.scrollTop = next;
+      updateBoardScrollButtons();
+      refreshBoardHover();
+      railScroll.raf = requestAnimationFrame(tick);
+    };
+    railScroll.raf = requestAnimationFrame(tick);
   }
 
   function highlightTarget(centerX) {
@@ -1016,8 +1489,11 @@
 
   function moveDrag(clientX, clientY) {
     const coords = boardCoords(clientX, clientY);
+    drag.lastClientX = clientX;
+    drag.lastClientY = clientY;
     drag.lastX = coords.x;
     drag.lastY = coords.y;
+    updateRailAutoScroll(clientX, clientY);
     const nodeW = (drag.node && drag.node.offsetWidth) || STICKER_WIDTH;
     const nodeH = (drag.node && drag.node.offsetHeight) || 110;
     const snapped = applyMagnet(coords.x - drag.grabDX, coords.y - drag.grabDY, nodeW, nodeH, drag.taskId);
@@ -1062,6 +1538,19 @@
       const baseTop = Number.parseFloat(node.style.top || '0') || 0;
       node.style.transform = `translateY(${Math.round(newTop - baseTop)}px)`;
     }
+    const overBoardId = boardTabAtPoint(clientX, clientY);
+    drag.overBoardId =
+      overBoardId && overBoardId !== store.activeBoardId() ? overBoardId : null;
+    if (drag.overBoardId) {
+      clearLaneHighlight();
+      clearPushPreview();
+      highlightBoardTab(drag.overBoardId);
+      if (!railScroll.raf) scheduleHoverSwitch(drag.overBoardId);
+      else clearHoverSwitch();
+      return;
+    }
+    clearHoverSwitch();
+    clearBoardTabHighlight();
     highlightTarget(snapped.x + nodeW / 2);
   }
 
@@ -1102,7 +1591,12 @@
   }
 
   function dropDrag(clientX, clientY) {
+    clearHoverSwitch();
+    stopRailAutoScroll();
     const coords = boardCoords(clientX, clientY);
+    const dropBoardId = boardTabAtPoint(clientX, clientY);
+    drag.overBoardId =
+      dropBoardId && dropBoardId !== store.activeBoardId() ? dropBoardId : null;
     const nodeW = (drag.node && drag.node.offsetWidth) || STICKER_WIDTH;
     const nodeHeight = (drag.node && drag.node.offsetHeight) || 110;
     const snapped = applyMagnet(coords.x - drag.grabDX, coords.y - drag.grabDY, nodeW, nodeHeight, drag.taskId);
@@ -1113,6 +1607,63 @@
     const targetId = columnIdAtBoardX(centerX) || drag.origColumnId;
     const group = drag.group && drag.group.length > 1 ? drag.group : null;
     const groupIds = group ? group.map((member) => member.id) : [drag.taskId];
+    const dropOnOtherTab = drag.overBoardId && drag.overBoardId !== store.activeBoardId();
+
+    // Стикер уже перетащили на другую доску (вкладка переключилась по
+    // наведению). Здесь не нужен WIP-пул: ставим туда, куда бросили.
+    if (drag.sourceBoardId && drag.sourceBoardId !== store.activeBoardId() && !dropOnOtherTab) {
+      const activeSnapshot = store.snapshot();
+      const targetColumn =
+        activeSnapshot.columns.find((column) => column.id === targetId) || activeSnapshot.columns[0];
+      if (!targetColumn) {
+        cancelDragVisual();
+        drag.taskId = null;
+        drag.node = null;
+        drag.pointerId = null;
+        return;
+      }
+      const spot = orderNeighbors(targetColumn.id, centerY, groupIds);
+      const sourceBoardId = drag.sourceBoardId;
+      const targetBoardId = store.activeBoardId();
+      const targetBoardName = (store.listBoards().find((entry) => entry.id === targetBoardId) || {}).name;
+      const result = store.transferTasks([drag.taskId], targetBoardId, {
+        sourceBoardId,
+        targetColumnId: targetColumn.id,
+        x: nx,
+        y: ny,
+      });
+      if (!result.ok) {
+        const message =
+          result.reason === 'wip'
+            ? `«${result.columnTitle || targetColumn.title}»: WIP-лимит ${result.limit} — стикер не перенесён.`
+            : 'Не получилось перенести стикер на другую доску';
+        toast(message, null);
+        cancelDragVisual();
+        drag.taskId = null;
+        drag.node = null;
+        drag.pointerId = null;
+        if (sourceBoardId && sourceBoardId !== store.activeBoardId()) {
+          switchToBoard(sourceBoardId);
+        }
+        return;
+      }
+      store.moveTask(drag.taskId, targetColumn.id, {
+        afterId: spot.afterId,
+        beforeId: spot.beforeId,
+        x: nx,
+        y: ny,
+      });
+      landedTaskId = drag.taskId;
+      cancelDragVisual();
+      drag.taskId = null;
+      drag.node = null;
+      drag.pointerId = null;
+      render();
+      snapshotGeom();
+      toast(`Стикер на «${targetBoardName || 'другой доске'}»`, null);
+      return;
+    }
+
     // WIP с учётом всей группы: считаем входящих в целевую дорожку.
     const preSnapshot = store.snapshot();
     const preTarget = preSnapshot.columns.find((column) => column.id === targetId);
@@ -1161,6 +1712,58 @@
       }
     };
     const movedId = drag.taskId;
+    // Бросок на вкладку другой доски — перенос стикеров туда.
+    if (drag.overBoardId && drag.overBoardId !== store.activeBoardId()) {
+      const targetBoardId = drag.overBoardId;
+      const targetBoard = store.listBoards().find((entry) => entry.id === targetBoardId);
+      const originBoardId = drag.sourceBoardId;
+      const result = store.transferTasks(
+        groupIds,
+        targetBoardId,
+        originBoardId && originBoardId !== targetBoardId ? { sourceBoardId: originBoardId } : undefined
+      );
+      if (!result.ok) {
+        const message =
+          result.reason === 'wip'
+            ? `«${result.columnTitle || 'Колонка'}»: WIP-лимит ${result.limit} — перенос не выполнен.`
+            : 'Не получилось перенести стикеры на другую доску';
+        toast(message, null);
+        returnAllToOrigin();
+        cancelDragVisual();
+        drag.taskId = null;
+        drag.node = null;
+        drag.pointerId = null;
+        if (originBoardId && originBoardId !== store.activeBoardId()) {
+          switchToBoard(originBoardId);
+        }
+        return;
+      }
+      cancelDragVisual();
+      drag.taskId = null;
+      drag.node = null;
+      drag.pointerId = null;
+      switchToBoard(targetBoardId);
+      // После переключения сохраняем ту раскладку, которую сделал render.
+      const items = [];
+      for (const id of groupIds) {
+        const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${id}"]`);
+        if (!node) continue;
+        const left = Number.parseFloat(node.style.left || '0') || 0;
+        const top = Number.parseFloat(node.style.top || '0') || 0;
+        items.push({ id, x: Math.round(left), y: Math.round(top) });
+      }
+      if (items.length) store.updatePositionsBatch(items);
+      render();
+      snapshotGeom();
+      const boardName = targetBoard ? targetBoard.name : 'другую доску';
+      toast(
+        groupIds.length > 1
+          ? `Перенесено стикеров: ${groupIds.length} → «${boardName}»`
+          : `Стикер перенесён на «${boardName}»`,
+        null
+      );
+      return;
+    }
     if (preBlocked) {
       toast(
         `«${preTarget ? preTarget.title : 'Колонка'}»: WIP-лимит ${preTarget.wipLimit} — группа не входит. Сначала заверши что-то из текущего.`,
@@ -1225,6 +1828,9 @@
   function cancelDragVisual() {
     document.body.classList.remove('dragging-active');
     clearLaneHighlight();
+    clearBoardTabHighlight();
+    clearHoverSwitch();
+    stopRailAutoScroll();
     clearPushPreview();
     const liveNodes = drag.group && drag.group.length > 1
       ? drag.group.map((member) => member.node)
@@ -1247,9 +1853,22 @@
     drag.targetColumnId = null;
     drag.targetBlocked = false;
     drag.group = null;
+    drag.overBoardId = null;
+    drag.sourceBoardId = null;
   }
 
   function onPointerMove(event) {
+    // Средняя кнопка — панорамирование доски.
+    if (pan.active && event.pointerId === pan.pointerId) {
+      event.preventDefault();
+      const dx = event.clientX - pan.startX;
+      const dy = event.clientY - pan.startY;
+      if (dom.boardWrap) {
+        dom.boardWrap.scrollLeft = pan.scrollLeft - dx;
+        dom.boardWrap.scrollTop = pan.scrollTop - dy;
+      }
+      return;
+    }
     if (drag.pointerId !== null && event.pointerId === drag.pointerId && drag.node) {
       if (!drag.active) {
         const dx = event.clientX - drag.startClientX;
@@ -1334,6 +1953,10 @@
   }
 
   function onPointerUp(event) {
+    if (pan.active && event.pointerId === pan.pointerId) {
+      endPan();
+      return;
+    }
     if (drag.pointerId !== null && event.pointerId === drag.pointerId) {
       if (drag.active) {
         dropDrag(event.clientX, event.clientY);
@@ -1417,9 +2040,11 @@
   // и клик-создание должны начинаться из любой точки (включая края-паддинги
   // .board-wrap), кроме стикеров. События с доски добубливают наверх как раньше.
   dom.boardWrap.addEventListener('pointerdown', onPointerDown);
+  dom.boardWrap.addEventListener('pointerdown', beginPan);
   window.addEventListener('pointermove', onPointerMove, { passive: false });
   window.addEventListener('pointerup', onPointerUp);
   window.addEventListener('pointercancel', () => {
+    endPan();
     if (drag.active && drag.node) {
       drag.node.style.left = `${drag.origX}px`;
       drag.node.style.top = `${drag.origY}px`;
@@ -1438,20 +2063,30 @@
     if (event.button === 1) event.preventDefault();
   });
 
-  // Окно потянули — X стикеров едут за своими дорожками (рефлоу),
-  // глубина под контент остаётся.
+  // Окно потянули/изменили масштаб — X стикеров едут за своими дорожками
+  // (рефлоу), глубина под контент остаётся. Геометрия пишется в доску,
+  // чтобы другие доски тоже корректно открылись в новом масштабе.
   let resizeTimer = null;
-  window.addEventListener('resize', () => {
+  function handleGeometryChange() {
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       resizeTimer = null;
+      if (drag.active) return;
       fitBoardToContent._last = 0;
-      fitBoardToContent();
       const newGeom = currentGeom();
       if (lastGeom) reflowBoardPositions(lastGeom, newGeom);
+      fitBoardToContent();
       snapshotGeom();
+      updateBoardScrollButtons();
     }, 150);
-  });
+  }
+  window.addEventListener('resize', handleGeometryChange);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', handleGeometryChange);
+  // Смена масштаба не всегда приходит как resize — ловим изменение DPR.
+  const dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+  if (dprQuery && typeof dprQuery.addEventListener === 'function') {
+    dprQuery.addEventListener('change', handleGeometryChange);
+  }
 
   // Не успели записать — пробуем блокирующе при выгрузке.
   window.addEventListener('beforeunload', () => {
@@ -1467,9 +2102,14 @@
   // ---------------------------------------------------------------------
 
   let draftNode = null;
+  let draftHistoryDetach = null;
 
   function closeDraft(removeOnly) {
     if (!draftNode) return;
+    if (draftHistoryDetach) {
+      draftHistoryDetach();
+      draftHistoryDetach = null;
+    }
     draftNode.remove();
     draftNode = null;
     hideFormatPop();
@@ -1493,6 +2133,7 @@
     node.appendChild(element('div', 'draft-hint', 'Ctrl+Enter — сохранить · Esc — отмена'));
     dom.board.appendChild(node);
     draftNode = node;
+    draftHistoryDetach = attachTextHistory(title, createTextHistory(title));
     title.focus();
     try {
       const range = document.createRange();
@@ -1533,6 +2174,10 @@
     const top = Number.parseFloat(draftNode.style.top || '0') || 0;
     const node = draftNode;
     draftNode = null;
+    if (draftHistoryDetach) {
+      draftHistoryDetach();
+      draftHistoryDetach = null;
+    }
     node.remove();
     hideFormatPop();
     if (!Core.strippedText(text)) return;
@@ -1541,6 +2186,7 @@
     const snapshot = store.snapshot();
     const target = snapshot.columns.find((column) => column.id === columnId) || snapshot.columns[0];
     if (!target) return;
+    settleRequested = true;
     const result = store.createTask({
       columnId: target.id,
       text,
@@ -1549,6 +2195,7 @@
       y: Math.round(top),
     });
     if (!result.ok) {
+      settleRequested = false;
       if (result.reason === 'wip') {
         toast(`«${target.title}»: WIP-лимит ${target.wipLimit} — стикер не добавлен`, null);
       }
@@ -1596,6 +2243,10 @@
 
     textEl.addEventListener('keydown', onInlineTextKey);
     node.addEventListener('focusout', onInlineFocusOut);
+    inlineEdit.history = createTextHistory(textEl);
+    inlineEdit.detachHistory = attachTextHistory(textEl, inlineEdit.history);
+    inlineEdit.onInput = () => settleOverlaps({ commit: false });
+    textEl.addEventListener('input', inlineEdit.onInput);
   }
 
   function onInlineTextKey(event) {
@@ -1624,9 +2275,14 @@
   }
 
   function detachInlineListeners() {
-    const { node, textEl } = inlineEdit;
+    const { node, textEl, detachHistory, onInput } = inlineEdit;
+    if (textEl && onInput) textEl.removeEventListener('input', onInput);
     if (textEl) textEl.removeEventListener('keydown', onInlineTextKey);
     if (node) node.removeEventListener('focusout', onInlineFocusOut);
+    if (detachHistory) detachHistory();
+    inlineEdit.history = null;
+    inlineEdit.detachHistory = null;
+    inlineEdit.onInput = null;
     hideFormatPop();
   }
 
@@ -1645,6 +2301,7 @@
       render();
       return;
     }
+    settleRequested = true;
     const result = store.updateTask(taskId, { text });
     if (result && result.ok === false && result.reason === 'empty-text') {
       render();
@@ -1701,6 +2358,8 @@
       { format: 'bigger', html: 'A+', title: 'Шрифт больше' },
       { sep: true },
       { format: 'clear', html: '⊘', title: 'Убрать форматирование' },
+      { sep: true },
+      { format: 'copy', html: '⧉', title: 'Копировать выделенный текст' },
     ];
     for (const entry of buttons) {
       if (entry.sep) {
@@ -1775,9 +2434,54 @@
     return 17;
   }
 
+  function fallbackCopyText(text) {
+    try {
+      const field = document.createElement('textarea');
+      field.value = text;
+      field.setAttribute('readonly', '');
+      field.style.position = 'fixed';
+      field.style.left = '-9999px';
+      document.body.appendChild(field);
+      field.select();
+      const ok = document.execCommand('copy');
+      field.remove();
+      return ok;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function copySelectionText(text) {
+    const value = String(text || '');
+    if (!value.trim()) {
+      toast('Сначала выдели текст', null);
+      return;
+    }
+    const report = (ok) => toast(ok ? 'Выделенный текст скопирован' : 'Не удалось скопировать', null);
+    if (window.kanbanAPI && typeof window.kanbanAPI.copyText === 'function') {
+      Promise.resolve(window.kanbanAPI.copyText(value))
+        .then((result) => report(!result || result.ok !== false))
+        .catch(() => report(fallbackCopyText(value)));
+      return;
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard
+        .writeText(value)
+        .then(() => report(true))
+        .catch(() => report(fallbackCopyText(value)));
+      return;
+    }
+    report(fallbackCopyText(value));
+  }
+
   function applyFormat(format) {
     const root = activeEditableRoot();
     if (!root) return;
+    if (format === 'copy') {
+      const selection = window.getSelection();
+      copySelectionText(selection ? selection.toString() : '');
+      return;
+    }
     if (format === 'bold') document.execCommand('bold', false, null);
     else if (format === 'italic') document.execCommand('italic', false, null);
     else if (format === 'strike') document.execCommand('strikeThrough', false, null);
@@ -1806,6 +2510,7 @@
         font.replaceWith(span);
       });
     }
+    if (root._textHistory) root._textHistory.snapshot();
     updateFormatPop();
   }
 
@@ -1825,6 +2530,7 @@
   let editorNode = null;
   let editorTaskId = null;
   let editorDraft = null;
+  let editorHistoryDetach = null;
 
   function openEditor(taskId) {
     if (draftNode) commitDraft();
@@ -1915,6 +2621,7 @@
 
     dom.modalBackdrop.addEventListener('click', onBackdropClick);
     dom.modalBackdrop.addEventListener('transitionend', hideBackdropIfIdle);
+    editorHistoryDetach = attachTextHistory(textInput, createTextHistory(textInput));
     textInput.focus();
     try {
       const range = document.createRange();
@@ -1965,11 +2672,16 @@
       toast('У стикера должен быть текст', null);
       return;
     }
+    if (result && result.ok) settleRequested = true;
     if (shouldClose) closeEditor();
   }
 
   function closeEditor() {
     if (!editorNode) return;
+    if (editorHistoryDetach) {
+      editorHistoryDetach();
+      editorHistoryDetach = null;
+    }
     editorNode.remove();
     editorNode = null;
     editorTaskId = null;
@@ -1979,6 +2691,7 @@
     setTimeout(() => {
       if (!editorNode) dom.modalBackdrop.hidden = true;
     }, 260);
+    settleRequested = true;
     render();
   }
 
@@ -2079,6 +2792,76 @@
     return COLORS[Math.floor(Math.random() * COLORS.length)];
   }
 
+  // «Упорядочить»: аккуратные стопки в каждой колонке, без наложений.
+  // Порядок берём по тому, что видно на доске сейчас (y), а для скрытых
+  // поиском задач — по сохранённым координатам/order.
+  function arrangeBoard() {
+    if (draftNode) commitDraft();
+    if (inlineEdit.node) commitInlineEdit();
+    const snapshot = store.snapshot();
+    const lanes = new Map(measureLanes().map((lane) => [lane.id, lane]));
+    const items = [];
+    for (const column of snapshot.columns) {
+      const anchor = laneListTop(column.id);
+      const lane = lanes.get(column.id);
+      if (!anchor) continue;
+      const tasks = snapshot.tasks
+        .filter((task) => task.columnId === column.id && task.deletedAt === null)
+        .map((task) => {
+          const node = dom.board.querySelector(`:scope > .sticker[data-task-id="${task.id}"]`);
+          const top = node
+            ? Number.parseFloat(node.style.top || '0') || 0
+            : Number.isFinite(task.y)
+              ? task.y
+              : Number.POSITIVE_INFINITY;
+          return {
+            task,
+            node,
+            top,
+            width: node ? node.offsetWidth || STICKER_WIDTH : STICKER_WIDTH,
+            height: node ? node.offsetHeight || 110 : 110,
+          };
+        })
+        .sort((a, b) => {
+          if (a.top !== b.top) return a.top - b.top;
+          return compareTaskOrder(a.task, b.task);
+        });
+      let cursor = Math.max(0, Math.round(anchor.y));
+      for (const entry of tasks) {
+        // Центр колонки, а не левый край: стопка выглядит как колонка стикеров.
+        const x = lane
+          ? Math.max(0, Math.round((lane.left + lane.right) / 2 - entry.width / 2))
+          : Math.max(0, Math.round(anchor.x));
+        const y = Math.max(0, Math.round(cursor));
+        if (entry.task.x !== x || entry.task.y !== y) {
+          items.push({ id: entry.task.id, x, y });
+        }
+        if (entry.node) {
+          entry.node.style.left = `${x}px`;
+          entry.node.style.top = `${y}px`;
+          markReflowed(entry.node);
+        }
+        cursor += entry.height + STICKER_GAP;
+      }
+    }
+    if (!items.length) {
+      toast('Стикеры уже стоят аккуратно', null);
+      return;
+    }
+    store.updatePositionsBatch(items);
+    render();
+    snapshotGeom();
+    toast(`Упорядочено стикеров: ${items.length}`, null);
+  }
+
+  function compareTaskOrder(a, b) {
+    const ay = Number.isFinite(a.y) ? a.y : Number.POSITIVE_INFINITY;
+    const by = Number.isFinite(b.y) ? b.y : Number.POSITIVE_INFINITY;
+    if (ay !== by) return ay - by;
+    if (a.order !== b.order) return a.order - b.order;
+    return String(a.id).localeCompare(String(b.id));
+  }
+
   // ---------------------------------------------------------------------
   // Заголовки колонок
   // ---------------------------------------------------------------------
@@ -2140,9 +2923,9 @@
 
     const pop = element('div', 'column-menu');
     pop.style.cssText =
-      'position:fixed;z-index:50;background:var(--paper);border-radius:12px;' +
+      'position:relative;background:var(--paper);border-radius:12px;' +
       'box-shadow:0 18px 40px -14px rgba(40,34,22,.55);padding:10px;display:flex;' +
-      'flex-direction:column;gap:6px;min-width:200px;';
+      'flex-direction:column;gap:6px;width:100%;';
 
     const wipRow = element('div', '');
     wipRow.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 6px;';
@@ -2205,19 +2988,37 @@
     dom.confirmPop.innerHTML = '';
     dom.confirmPop.appendChild(pop);
     dom.confirmPop.hidden = false;
+    placeConfirmPop(anchor);
+  }
+
+  function placeConfirmPop(anchor) {
+    if (!anchor || !dom.confirmPop || dom.confirmPop.hidden) return;
     const rect = anchor.getBoundingClientRect();
     const popRect = dom.confirmPop.getBoundingClientRect();
-    let left = rect.right - popRect.width;
-    let top = rect.bottom + 8;
-    if (left < 10) left = 10;
-    if (top + popRect.height > window.innerHeight - 10) top = rect.top - popRect.height - 8;
-    dom.confirmPop.style.left = `${left}px`;
-    dom.confirmPop.style.top = `${top}px`;
+    const margin = 10;
+    const gap = 8;
+    const maxHeight = Math.max(80, window.innerHeight - margin * 2);
+    if (popRect.height > maxHeight) {
+      dom.confirmPop.style.maxHeight = `${maxHeight}px`;
+      dom.confirmPop.style.overflowY = 'auto';
+    }
+    const measured = dom.confirmPop.getBoundingClientRect();
+    let left = rect.right - measured.width;
+    left = Math.max(margin, Math.min(window.innerWidth - measured.width - margin, left));
+    let top = rect.bottom + gap;
+    if (top + measured.height > window.innerHeight - margin) {
+      top = rect.top - measured.height - gap;
+    }
+    top = Math.max(margin, Math.min(window.innerHeight - measured.height - margin, top));
+    dom.confirmPop.style.left = `${Math.round(left)}px`;
+    dom.confirmPop.style.top = `${Math.round(top)}px`;
   }
 
   function closeConfirmPop() {
     dom.confirmPop.hidden = true;
     dom.confirmPop.innerHTML = '';
+    dom.confirmPop.style.maxHeight = '';
+    dom.confirmPop.style.overflowY = '';
   }
 
   document.addEventListener('pointerdown', (event) => {
@@ -2230,10 +3031,50 @@
   // ---------------------------------------------------------------------
 
   let boardRename = null; // { boardId } — пока правим имя, вкладки не перестраиваем
+  let draggedBoardId = null;
+  let boardDropTarget = null; // { id, after }
+
+  function clearBoardDropMarks() {
+    boardDropTarget = null;
+    draggedBoardId = null;
+    if (!dom.boardsList) return;
+    for (const tab of dom.boardsList.querySelectorAll(':scope > .board-tab')) {
+      tab.classList.remove('drop-before', 'drop-after');
+    }
+  }
+
+  function applyBoardDrop() {
+    if (!draggedBoardId || !boardDropTarget) {
+      clearBoardDropMarks();
+      return;
+    }
+    const ids = store.listBoards().map((entry) => entry.id);
+    if (!ids.includes(draggedBoardId) || !ids.includes(boardDropTarget.id)) {
+      clearBoardDropMarks();
+      return;
+    }
+    const without = ids.filter((id) => id !== draggedBoardId);
+    let insertAt = without.indexOf(boardDropTarget.id);
+    if (insertAt < 0) insertAt = without.length;
+    if (boardDropTarget.after) insertAt += 1;
+    without.splice(insertAt, 0, draggedBoardId);
+    if (without.join('|') === ids.join('|')) {
+      clearBoardDropMarks();
+      return;
+    }
+    const result = store.reorderBoards(without);
+    clearBoardDropMarks();
+    if (!result.ok) {
+      toast('Не получилось переставить вкладки', null);
+      return;
+    }
+    renderBoards();
+  }
 
   function renderBoards() {
     if (!dom.boardsList) return;
     if (boardRename) return;
+    const scrollTop = dom.boardsList.scrollTop;
     const boards = store.listBoards();
     const activeId = store.activeBoardId();
     dom.boardsList.innerHTML = '';
@@ -2243,10 +3084,51 @@
       tab.dataset.boardId = entry.id;
       tab.setAttribute('role', 'tab');
       tab.setAttribute('aria-selected', entry.id === activeId ? 'true' : 'false');
-      tab.title = `${entry.name} — открытых: ${entry.taskCount}. Клик — открыть, двойной клик — переименовать, правый клик — удалить`;
+      tab.draggable = true;
+      tab.title = `${entry.name} — открытых: ${entry.taskCount}. Клик — открыть, перетащи — изменить порядок, двойной клик — переименовать, правый клик — удалить`;
       tab.appendChild(element('span', 'board-tab-name', entry.name));
       tab.appendChild(element('span', 'board-tab-count', String(entry.taskCount)));
       tab.addEventListener('click', () => switchToBoard(entry.id));
+      tab.addEventListener('dragstart', (event) => {
+        draggedBoardId = entry.id;
+        boardDropTarget = null;
+        tab.classList.add('dragging-board');
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          try {
+            event.dataTransfer.setData('text/plain', entry.id);
+          } catch (error) {
+            /* некоторые платформы запрещают setData */
+          }
+        }
+      });
+      tab.addEventListener('dragend', () => {
+        draggedBoardId = null;
+        tab.classList.remove('dragging-board');
+        clearBoardDropMarks();
+      });
+      tab.addEventListener('dragover', (event) => {
+        if (!draggedBoardId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        const rect = tab.getBoundingClientRect();
+        const after = event.clientY > rect.top + rect.height / 2;
+        boardDropTarget = { id: entry.id, after };
+        for (const other of dom.boardsList.querySelectorAll(':scope > .board-tab')) {
+          other.classList.toggle('drop-before', other === tab && !after);
+          other.classList.toggle('drop-after', other === tab && after);
+        }
+      });
+      tab.addEventListener('drop', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = tab.getBoundingClientRect();
+        if (!boardDropTarget || boardDropTarget.id !== entry.id) {
+          boardDropTarget = { id: entry.id, after: event.clientY > rect.top + rect.height / 2 };
+        }
+        applyBoardDrop();
+      });
       tab.addEventListener('dblclick', (event) => {
         event.preventDefault();
         startBoardRename(entry.id, tab);
@@ -2257,6 +3139,43 @@
       });
       dom.boardsList.appendChild(tab);
     }
+    dom.boardsList.scrollTop = scrollTop;
+    updateBoardScrollButtons();
+  }
+
+  if (dom.boardsList) {
+    dom.boardsList.addEventListener('scroll', updateBoardScrollButtons, { passive: true });
+    holdBoardScrollButton(dom.boardsScrollUp, -80);
+    holdBoardScrollButton(dom.boardsScrollDown, 80);
+    dom.boardsList.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowUp' || event.key === 'PageUp') {
+        event.preventDefault();
+        scrollBoardsStep(event.key === 'PageUp' ? -240 : -80);
+      } else if (event.key === 'ArrowDown' || event.key === 'PageDown') {
+        event.preventDefault();
+        scrollBoardsStep(event.key === 'PageDown' ? 240 : 80);
+      }
+    });
+    dom.boardsList.addEventListener('dragover', (event) => {
+      if (!draggedBoardId) return;
+      if (event.target.closest && event.target.closest('.board-tab')) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      const tabs = dom.boardsList.querySelectorAll(':scope > .board-tab');
+      const last = tabs[tabs.length - 1];
+      if (!last) return;
+      boardDropTarget = { id: last.dataset.boardId, after: true };
+      for (const tab of tabs) {
+        tab.classList.toggle('drop-after', tab === last);
+        tab.classList.remove('drop-before');
+      }
+    });
+    dom.boardsList.addEventListener('drop', (event) => {
+      if (!draggedBoardId) return;
+      if (event.target.closest && event.target.closest('.board-tab')) return;
+      event.preventDefault();
+      applyBoardDrop();
+    });
   }
 
   function switchToBoard(boardId) {
@@ -2270,15 +3189,22 @@
     // Поиск — в пределах доски: при переключении сбрасываем.
     if (dom.searchInput.value !== '') {
       dom.searchInput.value = '';
+      dom.searchBox.classList.remove('has-query');
       store.setQuery('');
     }
     selectedIds.clear();
+    // Фиксируем текущую геометрию уходящей доски: при следующем открытии
+    // её стикеры пересчитаются по актуальному окну, а не останутся в старом.
+    const leavingLayout = store.getBoardLayout();
+    if (leavingLayout) reflowBoardPositions(leavingLayout, currentGeom());
+    snapshotGeom();
     const result = store.switchBoard(boardId);
     if (!result.ok) {
       toast('Не получилось переключить доску', null);
       return;
     }
     // render() уже вызван подпиской; дотягиваем геометрию новой доски.
+    applyStoredLayout();
     repairCenteredStickers();
     render();
     snapshotGeom();
@@ -2351,9 +3277,9 @@
 
     const pop = element('div', 'column-menu');
     pop.style.cssText =
-      'position:fixed;z-index:50;background:var(--paper);border-radius:12px;' +
+      'position:relative;background:var(--paper);border-radius:12px;' +
       'box-shadow:0 18px 40px -14px rgba(40,34,22,.55);padding:10px;display:flex;' +
-      'flex-direction:column;gap:6px;min-width:200px;';
+      'flex-direction:column;gap:6px;width:100%;';
     const title = element('div', 'field-label', entry.name);
     title.style.cssText =
       'padding:4px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;';
@@ -2395,9 +3321,11 @@
         selectedIds.clear();
         if (dom.searchInput.value !== '') {
           dom.searchInput.value = '';
+          dom.searchBox.classList.remove('has-query');
           store.setQuery('');
         }
         render();
+        applyStoredLayout();
         repairCenteredStickers();
         render();
         snapshotGeom();
@@ -2407,20 +3335,14 @@
       noBtn.addEventListener('click', closeConfirmPop);
       pop.appendChild(yesBtn);
       pop.appendChild(noBtn);
+      placeConfirmPop(anchor);
     });
     pop.appendChild(removeBtn);
 
     dom.confirmPop.innerHTML = '';
     dom.confirmPop.appendChild(pop);
     dom.confirmPop.hidden = false;
-    const rect = anchor.getBoundingClientRect();
-    const popRect = dom.confirmPop.getBoundingClientRect();
-    let left = rect.right - popRect.width;
-    let top = rect.bottom + 8;
-    if (left < 10) left = 10;
-    if (top + popRect.height > window.innerHeight - 10) top = rect.top - popRect.height - 8;
-    dom.confirmPop.style.left = `${left}px`;
-    dom.confirmPop.style.top = `${top}px`;
+    placeConfirmPop(anchor);
   }
 
   if (dom.addBoardBtn) {
@@ -2431,7 +3353,10 @@
       closeDraft(true);
       hideFormatPop();
       store.flushSync();
-      if (dom.searchInput.value !== '') dom.searchInput.value = '';
+      if (dom.searchInput.value !== '') {
+        dom.searchInput.value = '';
+        dom.searchBox.classList.remove('has-query');
+      }
       selectedIds.clear();
       const result = store.createBoard(`Доска ${store.listBoards().length + 1}`);
       if (!result.ok) {
@@ -2439,6 +3364,7 @@
         return;
       }
       render();
+      applyStoredLayout();
       repairCenteredStickers();
       render();
       snapshotGeom();
@@ -2462,6 +3388,10 @@
       toast('Колонка добавлена — переименуй её кликом по заголовку', null);
     }
   });
+
+  if (dom.arrangeBtn) {
+    dom.arrangeBtn.addEventListener('click', arrangeBoard);
+  }
 
   // ---------------------------------------------------------------------
   // Тосты
@@ -2623,6 +3553,9 @@
     if (dom.exportBtn) {
       dom.exportBtn.addEventListener('click', async () => {
         try {
+          // Сначала дозаписываем текущее состояние, иначе копия может
+          // отстать от того, что видно на доске.
+          await store.flush();
           const result = await window.kanbanAPI.exportBoard();
           if (result && result.ok) toast('Копия доски сохранена', null);
           else if (result && result.reason !== 'cancelled') {
@@ -2649,7 +3582,12 @@
             return;
           }
           selectedIds.clear();
+          if (dom.searchInput.value !== '') {
+            dom.searchInput.value = '';
+            dom.searchBox.classList.remove('has-query');
+          }
           render();
+          applyStoredLayout();
           repairCenteredStickers();
           render();
           snapshotGeom();
@@ -2668,7 +3606,9 @@
   function startup() {
     render();
     // Геометрия могла отличаться от той, где файл сохраняли:
-    // центр-снапнутые дотягиваем до актуального центра, остальные не трогаем.
+    // пересчитываем X по сохранённой геометрии этой доски, затем
+    // центр-снапнутые дотягиваем до актуального центра.
+    applyStoredLayout();
     repairCenteredStickers();
     render();
     snapshotGeom();
@@ -2676,6 +3616,7 @@
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(() => {
         try {
+          applyStoredLayout();
           repairCenteredStickers();
           render();
           snapshotGeom();
@@ -2699,7 +3640,7 @@
   // Сценарий смоук-теста: гоняет реальные действия и рапортует в stdout.
   // ---------------------------------------------------------------------
 
-  function dispatchPointer(type, target, clientX, clientY, pointerId) {
+  function dispatchPointer(type, target, clientX, clientY, pointerId, button) {
     const event = new PointerEvent(type, {
       bubbles: true,
       cancelable: true,
@@ -2707,15 +3648,15 @@
       pointerId,
       pointerType: 'mouse',
       isPrimary: true,
-      button: 0,
-      buttons: type === 'pointerup' ? 0 : 1,
+      button: Number.isFinite(button) ? button : 0,
+      buttons: type === 'pointerup' ? 0 : Number.isFinite(button) && button === 1 ? 4 : 1,
       clientX,
       clientY,
     });
     target.dispatchEvent(event);
   }
 
-  function runSmokeTest() {
+  async function runSmokeTest() {
     const results = [];
     const check = (name, condition, extra) => {
       results.push({ name, ok: Boolean(condition), extra: extra || '' });
@@ -3379,6 +4320,9 @@
         Boolean(dom.boardsList.querySelector('.board-tab.active')));
       // Вкладки закреплены: rail вне скролла доски, прокрутка не сдвигает ярлык.
       check('boards: вкладки вне скролла доски', !dom.boardWrap.contains(dom.boardsList));
+      check('boards: скроллбар рейла скрыт',
+        window.getComputedStyle(dom.boardsList).scrollbarWidth === 'none',
+        window.getComputedStyle(dom.boardsList).scrollbarWidth);
       const tabTopBefore = tabNodes()[0].getBoundingClientRect().top;
       dom.boardWrap.scrollTop = 300;
       check('boards: прокрутка не уносит вкладки',
@@ -3451,6 +4395,293 @@
       check('boards: доска удалена, активна первая',
         store.listBoards().length === 1 && store.activeBoardId() === firstBoardId,
         `${store.listBoards().length} ${store.activeBoardId() === firstBoardId}`);
+
+      // «Упорядочить»: стикер, брошенный в угол, встаёт в аккуратную стопку.
+      check('arrange: кнопка есть', Boolean(dom.arrangeBtn));
+      const arrangeProbe = store.createTask({
+        columnId: 'pool',
+        text: 'Для порядка',
+        x: 2,
+        y: 2,
+      });
+      render();
+      const poolAnchor = laneListTop('pool');
+      const arrangeLane = measureLanes().find((lane) => lane.id === 'pool');
+      dom.arrangeBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      const arrangedProbe = store.getTask(arrangeProbe.task.id);
+      const arrangedNode = dom.board.querySelector(
+        `:scope > .sticker[data-task-id="${arrangeProbe.task.id}"]`
+      );
+      const arrangedWidth = arrangedNode ? arrangedNode.offsetWidth : STICKER_WIDTH;
+      const centeredX = arrangeLane
+        ? Math.round((arrangeLane.left + arrangeLane.right) / 2 - arrangedWidth / 2)
+        : null;
+      check('arrange: стикер выровнен по центру колонки',
+        Boolean(poolAnchor) &&
+        centeredX !== null &&
+        arrangedProbe.x === centeredX &&
+        arrangedProbe.y >= Math.round(poolAnchor.y),
+        arrangedProbe ? `${arrangedProbe.x},${arrangedProbe.y} (центр ${centeredX})` : 'нет задачи');
+
+      // Рост стикера при дописывании: нижний сосед съезжает, Ctrl+Z откатывает текст.
+      const growSpot = freeSpotInColumn('pool');
+      const growA = store.createTask({
+        columnId: 'pool',
+        text: 'Верхний',
+        x: growSpot.x,
+        y: growSpot.y,
+      });
+      render();
+      const growNodeA = dom.board.querySelector(`:scope > .sticker[data-task-id="${growA.task.id}"]`);
+      const growHeightA = growNodeA ? growNodeA.offsetHeight : 55;
+      const growB = store.createTask({
+        columnId: 'pool',
+        text: 'Нижний',
+        x: growSpot.x,
+        y: growSpot.y + growHeightA + STICKER_GAP,
+      });
+      render();
+      const oldBottomY = store.getTask(growB.task.id).y;
+      if (growNodeA) {
+        const rectA = growNodeA.getBoundingClientRect();
+        dispatchPointer('pointerdown', growNodeA, rectA.left + 40, rectA.top + 18, 95);
+        dispatchPointer('pointerup', window, rectA.left + 40, rectA.top + 18, 95);
+        const growText = dom.board.querySelector('.sticker.editing-inline [data-role="text"]');
+        check('grow: инлайн открылся', Boolean(growText));
+        if (growText) {
+          const beforeUndo = growText.innerHTML;
+          growText.innerHTML = 'Верхний<div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div>';
+          growText.dispatchEvent(new Event('input', { bubbles: true }));
+          growText.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, key: 'z', ctrlKey: true,
+          }));
+          check('grow: Ctrl+Z вернул текст', growText.innerHTML === beforeUndo,
+            growText.innerHTML.slice(0, 40));
+          growText.innerHTML = 'Верхний<div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div><div>ещё</div>';
+          growText.dispatchEvent(new Event('input', { bubbles: true }));
+          growText.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, key: 'Enter', ctrlKey: true,
+          }));
+        }
+        render();
+        const afterBottom = store.getTask(growB.task.id);
+        check('grow: нижний стикер сдвинут вниз',
+          Boolean(afterBottom) && afterBottom.y > oldBottomY,
+          afterBottom ? `${oldBottomY}->${afterBottom.y}` : 'нет задачи');
+      } else {
+        check('grow: узел найден', false);
+      }
+
+      // Копирование выделенного в тулбаре форматирования.
+      const copyProbe = dom.board.querySelector(':scope > .sticker[data-task-id="seed-1"]');
+      if (copyProbe) {
+        const copyRect = copyProbe.getBoundingClientRect();
+        dispatchPointer('pointerdown', copyProbe, copyRect.left + 40, copyRect.top + 20, 96);
+        dispatchPointer('pointerup', window, copyRect.left + 40, copyRect.top + 20, 96);
+        const copyText = dom.board.querySelector('.sticker.editing-inline [data-role="text"]');
+        if (copyText) {
+          const range = document.createRange();
+          range.selectNodeContents(copyText);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          updateFormatPop();
+          check('copy: кнопка копирования в тулбаре',
+            Boolean(formatPop && formatPop.querySelector('[data-format="copy"]')));
+          check('copy: мост копирования доступен',
+            Boolean(window.kanbanAPI && typeof window.kanbanAPI.copyText === 'function'));
+          copyText.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, key: 'Escape',
+          }));
+        } else {
+          check('copy: инлайн открылся', false);
+        }
+      }
+
+      // Средняя кнопка — панорамирование доски.
+      const maxScrollTop = Math.max(0, dom.boardWrap.scrollHeight - dom.boardWrap.clientHeight);
+      dom.boardWrap.scrollTop = Math.min(100, maxScrollTop);
+      const panBefore = dom.boardWrap.scrollTop;
+      dispatchPointer('pointerdown', dom.boardWrap, 320, 300, 97, 1);
+      dispatchPointer('pointermove', window, 320, 250, 97, 1);
+      check('pan: средняя кнопка включила панорамирование',
+        dom.boardWrap.classList.contains('panning'));
+      check('pan: содержимое прокрутилось', dom.boardWrap.scrollTop > panBefore,
+        `${panBefore}->${dom.boardWrap.scrollTop}`);
+      dispatchPointer('pointerup', window, 320, 250, 97, 1);
+      check('pan: режим отпущен', !dom.boardWrap.classList.contains('panning'));
+      dom.boardWrap.scrollTop = 0;
+
+      // Перетаскивание стикера на вкладку другой доски.
+      const transit = store.createBoard('Транзит');
+      const transitId = transit.board.id;
+      check('cross-board: вторая доска создана', store.listBoards().length === 2);
+      const transitTask = store.createTask({ columnId: 'pool', text: 'На другую доску' });
+      render();
+      const transitNode = dom.board.querySelector(
+        `:scope > .sticker[data-task-id="${transitTask.task.id}"]`
+      );
+      const firstTabNow = dom.boardsList.querySelector(
+        `:scope > .board-tab[data-board-id="${firstBoardId}"]`
+      );
+      if (transitNode && firstTabNow) {
+        const transitRect = transitNode.getBoundingClientRect();
+        const tabRect = firstTabNow.getBoundingClientRect();
+        dispatchPointer('pointerdown', transitNode, transitRect.left + 40, transitRect.top + 20, 98);
+        dispatchPointer('pointermove', window, tabRect.left + tabRect.width / 2, tabRect.top + 20, 98);
+        check('cross-board: вкладка подсвечена',
+          firstTabNow.classList.contains('board-drop-target'));
+        dispatchPointer('pointerup', window, tabRect.left + tabRect.width / 2, tabRect.top + 20, 98);
+        check('cross-board: доска переключилась', store.activeBoardId() === firstBoardId);
+        check('cross-board: стикер переехал', Boolean(store.getTask(transitTask.task.id)));
+      } else {
+        check('cross-board: узлы найдены', false);
+      }
+
+      // Вкладки меняются местами drag-and-drop.
+      const tabA = dom.boardsList.querySelector(
+        `:scope > .board-tab[data-board-id="${firstBoardId}"]`
+      );
+      const tabB = dom.boardsList.querySelector(
+        `:scope > .board-tab[data-board-id="${transitId}"]`
+      );
+      if (tabA && tabB) {
+        const data = new DataTransfer();
+        tabB.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: data }));
+        const targetRect = tabA.getBoundingClientRect();
+        tabA.dispatchEvent(new DragEvent('dragover', {
+          bubbles: true, cancelable: true, dataTransfer: data, clientY: targetRect.top + 2,
+        }));
+        tabA.dispatchEvent(new DragEvent('drop', {
+          bubbles: true, cancelable: true, dataTransfer: data, clientY: targetRect.top + 2,
+        }));
+        tabB.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: data }));
+        const order = store.listBoards().map((entry) => entry.id);
+        check('tabs: порядок изменён перетаскиванием', order[0] === transitId,
+          order.join(','));
+      } else {
+        check('tabs: вкладки найдены', false);
+      }
+
+      // Плавный перенос: подержали стикер над вкладкой — доска открылась,
+      // и стикер можно поставить в любую колонку, не отпуская мышь.
+      const smooth = store.createBoard('Плавный перенос');
+      const smoothTask = store.createTask({ columnId: 'pool', text: 'Плавно на другую доску' });
+      render();
+      const smoothNode = dom.board.querySelector(
+        `:scope > .sticker[data-task-id="${smoothTask.task.id}"]`
+      );
+      const smoothTab = dom.boardsList.querySelector(
+        `:scope > .board-tab[data-board-id="${firstBoardId}"]`
+      );
+      if (smoothNode && smoothTab) {
+        const smoothRect = smoothNode.getBoundingClientRect();
+        const smoothTabRect = smoothTab.getBoundingClientRect();
+        dispatchPointer('pointerdown', smoothNode, smoothRect.left + 40, smoothRect.top + 20, 99);
+        dispatchPointer(
+          'pointermove',
+          window,
+          smoothTabRect.left + smoothTabRect.width / 2,
+          smoothTabRect.top + 20,
+          99
+        );
+        check('hover: вкладка подсвечена',
+          smoothTab.classList.contains('board-drop-target'));
+        await new Promise((resolve) => setTimeout(resolve, 560));
+        check('hover: доска переключилась без отпускания',
+          store.activeBoardId() === firstBoardId,
+          store.activeBoardId());
+        check('hover: перетаскивание продолжается',
+          Boolean(dom.board.querySelector('.sticker.dragging-live')));
+        const waitingColumn = dom.board.querySelector(':scope > .column[data-column-id="waiting"]');
+        if (waitingColumn) {
+          const waitRect = waitingColumn.getBoundingClientRect();
+          const dropX = waitRect.left + waitRect.width / 2;
+          const dropY = waitRect.top + 150;
+          dispatchPointer('pointermove', window, dropX, dropY, 99);
+          dispatchPointer('pointerup', window, dropX, dropY, 99);
+        }
+        const dropped = store.getTask(smoothTask.task.id);
+        check('hover: стикер встал в выбранную колонку',
+          Boolean(dropped) && dropped.columnId === 'waiting',
+          dropped ? dropped.columnId : 'нет задачи');
+        check('hover: доска осталась целевой', store.activeBoardId() === firstBoardId);
+      } else {
+        check('hover: узлы найдены', false);
+      }
+
+      // Прокрутка рейла без колеса: кнопки вверх/вниз, когда вкладок много.
+      for (let i = 0; i < 6; i += 1) store.createBoard(`Скролл ${i + 1}`);
+      render();
+      check('scroll: кнопка вниз появилась при переполнении',
+        Boolean(dom.boardsScrollDown) && !dom.boardsScrollDown.hidden);
+      dom.boardsList.scrollTop = 0;
+      dom.boardsScrollDown.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true, cancelable: true, pointerId: 100, button: 0, buttons: 1,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 360));
+      window.dispatchEvent(new PointerEvent('pointerup', {
+        bubbles: true, pointerId: 100, button: 0, buttons: 0,
+      }));
+      check('scroll: кнопка прокручивает рейл без колеса',
+        dom.boardsList.scrollTop > 0,
+        String(dom.boardsList.scrollTop));
+
+      // Автопрокрутка рейла, когда стикер держат у нижнего края вкладок.
+      const railProbe = store.createTask({ columnId: 'pool', text: 'У края вкладок' });
+      render();
+      const railProbeNode = dom.board.querySelector(
+        `:scope > .sticker[data-task-id="${railProbe.task.id}"]`
+      );
+      dom.boardsList.scrollTop = 0;
+      if (railProbeNode) {
+        const railRect = dom.boardsList.getBoundingClientRect();
+        const probeRect = railProbeNode.getBoundingClientRect();
+        dispatchPointer('pointerdown', railProbeNode, probeRect.left + 40, probeRect.top + 20, 101);
+        dispatchPointer(
+          'pointermove',
+          window,
+          railRect.right - 8,
+          railRect.bottom - 10,
+          101
+        );
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        check('scroll: drag у нижнего края прокручивает рейл',
+          dom.boardsList.scrollTop > 0,
+          String(dom.boardsList.scrollTop));
+        window.dispatchEvent(new PointerEvent('pointercancel', {
+          bubbles: true, pointerId: 101, button: 0, buttons: 0,
+        }));
+      } else {
+        check('scroll: стикер для проверки найден', false);
+      }
+
+      // Контекстное меню нижней вкладки не должно уходить за экран.
+      dom.boardsList.scrollTop = dom.boardsList.scrollHeight;
+      render();
+      const bottomTabs = dom.boardsList.querySelectorAll(':scope > .board-tab');
+      const bottomTab = bottomTabs[bottomTabs.length - 1];
+      if (bottomTab) {
+        bottomTab.dispatchEvent(new MouseEvent('contextmenu', {
+          bubbles: true, cancelable: true,
+        }));
+        const menuRect = dom.confirmPop.getBoundingClientRect();
+        const deleteButton = [...dom.confirmPop.querySelectorAll('button')]
+          .find((button) => button.textContent === 'Удалить доску');
+        if (deleteButton) deleteButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        const confirmRect = dom.confirmPop.getBoundingClientRect();
+        check('popover: меню нижней вкладки остаётся в экране',
+          !dom.confirmPop.hidden &&
+          menuRect.top >= 9 &&
+          menuRect.bottom <= window.innerHeight - 9 &&
+          confirmRect.top >= 9 &&
+          confirmRect.bottom <= window.innerHeight - 9,
+          `${Math.round(menuRect.top)}..${Math.round(menuRect.bottom)} / ` +
+          `${Math.round(confirmRect.top)}..${Math.round(confirmRect.bottom)}`);
+        closeConfirmPop();
+      } else {
+        check('popover: нижняя вкладка найдена', false);
+      }
 
       render();
     } catch (error) {

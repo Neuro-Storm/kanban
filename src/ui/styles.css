@@ -260,6 +260,14 @@ body::before {
   position: relative;
 }
 
+/* Панорамирование доски средней кнопкой мыши. */
+.board-wrap.panning,
+body.panning-active {
+  cursor: grabbing;
+  user-select: none;
+}
+.board-wrap.panning { scroll-behavior: auto; }
+
 /* --- Сцена: вкладки ВНЕ скролла доски --------------------------------------
    .board-stage — flex-строка на всё место под топбаром: слева rail вкладок
    (закреплён, не уезжает при прокрутке), справа .board-wrap (скроллится).
@@ -296,6 +304,17 @@ body::before {
   overflow-y: auto;
   overflow-x: hidden;
   align-items: flex-start;
+  /* Досок может быть много: прокрутка остаётся, но без уродливой
+     полосы в узком рейле — колесо/трекпад работают как обычно. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior: contain;
+}
+
+.boards-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 .board-tab {
@@ -317,7 +336,36 @@ body::before {
   font-size: 17px;
   overflow: hidden;
   cursor: pointer;
-  transition: background var(--speed-med) var(--ease-out), color var(--speed-med) var(--ease-out);
+  position: relative;
+  transition: background var(--speed-med) var(--ease-out), color var(--speed-med) var(--ease-out),
+    opacity var(--speed-fast) var(--ease-out);
+}
+
+.board-tab.dragging-board {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+/* Куда встанет перетаскиваемая вкладка: тонкая акцентная черта. */
+.board-tab.drop-before::before,
+.board-tab.drop-after::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--paper);
+}
+.board-tab.drop-before::before { top: -3px; }
+.board-tab.drop-after::after { bottom: -3px; }
+
+/* Стикер тащат на вкладку другой доски — подсветить приёмник. */
+.board-tab.board-drop-target {
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: inset -3px 0 0 var(--accent), 0 0 0 2px var(--accent);
 }
 
 .board-tab:hover { background: var(--lane-hover); color: var(--ink); }
@@ -383,6 +431,29 @@ body::before {
   cursor: pointer;
   transition: color var(--speed-med) var(--ease-out), background var(--speed-med) var(--ease-out);
 }
+
+/* Кнопки прокрутки рейла: нужны, когда колеса мыши нет, а досок много. */
+.boards-scroll {
+  flex: none;
+  align-self: center;
+  width: 28px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--speed-fast) var(--ease-out), background var(--speed-fast) var(--ease-out);
+}
+.boards-scroll:hover {
+  color: var(--ink);
+  background: var(--lane-hover);
+}
+.boards-scroll:active { transform: scale(0.94); }
 
 .boards-add:hover {
   color: var(--ink);
@@ -1183,6 +1254,48 @@ html[data-theme='rice'] .sticker[data-color='pink']   { background: #f3c3cb; }
 html[data-theme='rice'] .sticker[data-color='blue']   { background: #c2d6ec; }
 html[data-theme='rice'] .sticker[data-color='lilac']  { background: #d5c8e8; }
 html[data-theme='rice'] .column-title { letter-spacing: 1.5px; }
+
+/* Голубая: прохладный светлый лист, синие чернила и акварельные стикеры. */
+html[data-theme='blue'] {
+  --desk-a: #edf6fc;
+  --desk-b: #dcebf7;
+  --desk-c: #c9dced;
+  --paper: #f7fcff;
+
+  --ink: #23384a;
+  --ink-soft: #516b80;
+  --ink-faint: #8aa4b8;
+
+  --lane: rgba(255, 255, 255, 0.55);
+  --lane-border: rgba(42, 92, 128, 0.13);
+  --lane-hover: rgba(255, 255, 255, 0.88);
+
+  --accent: #2f7fb8;
+  --accent-soft: #b9dcf2;
+  --shadow-sticker: 0 2px 3px rgba(36, 66, 88, 0.13), 0 7px 16px -6px rgba(36, 66, 88, 0.26);
+  --shadow-sticker-hover: 0 4px 7px rgba(36, 66, 88, 0.15), 0 16px 28px -10px rgba(36, 66, 88, 0.32);
+  --shadow-lane: 0 1px 2px rgba(36, 66, 88, 0.05), 0 10px 28px -14px rgba(36, 66, 88, 0.2);
+}
+html[data-theme='blue'] body {
+  background:
+    radial-gradient(1200px 700px at 18% -10%, rgba(255, 255, 255, 0.92), transparent 60%),
+    radial-gradient(1000px 800px at 105% 115%, rgba(119, 164, 199, 0.4), transparent 55%),
+    linear-gradient(158deg, var(--desk-a) 0%, var(--desk-b) 52%, var(--desk-c) 100%);
+}
+html[data-theme='blue'] .sticker {
+  border: 1px solid rgba(42, 78, 105, 0.13);
+}
+html[data-theme='blue'] .sticker[data-color='yellow'] { background: #f7e7a1; }
+html[data-theme='blue'] .sticker[data-color='mint']   { background: #c9e7da; }
+html[data-theme='blue'] .sticker[data-color='peach']  { background: #f6d9b8; }
+html[data-theme='blue'] .sticker[data-color='pink']   { background: #f4c8d4; }
+html[data-theme='blue'] .sticker[data-color='blue']   { background: #c6ddf3; }
+html[data-theme='blue'] .sticker[data-color='lilac']  { background: #d8cdf0; }
+html[data-theme='blue'] .brand-title { color: #24445c; }
+html[data-theme='blue'] .column-title { color: #2c4a61; }
+html[data-theme='blue'] .search { background: rgba(255, 255, 255, 0.62); }
+html[data-theme='blue'] .search:focus-within { background: rgba(255, 255, 255, 0.95); }
+html[data-theme='blue'] .board-tab.active { color: #234159; }
 
 /* Пробковая доска: тёплая пробка, стикеры на булавках. */
 html[data-theme='cork'] {

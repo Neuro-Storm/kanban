@@ -8,7 +8,7 @@
  */
 'use strict';
 
-const { app, BrowserWindow, ipcMain, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeTheme, clipboard } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -26,6 +26,9 @@ let mainWindow = null;
 let boardFile = null;
 let smokeFinished = false;
 let smokeTimer = null;
+// Номер последней реально записанной ревизии: защищает от ситуации,
+// когда синхронная запись при выходе обгоняет более старую из очереди.
+let lastWriteRevision = -1;
 
 function resolveBoardFile() {
   if (SMOKE || SHOT) {
@@ -42,6 +45,14 @@ function readBoard() {
   } catch (error) {
     if (error.code !== 'ENOENT') {
       console.error('[kanban] не удалось прочитать доску:', error.message);
+      // Не теряем данные: копия повреждённого/нечитаемого файла остаётся
+      // рядом, а приложение может поднять стартовую доску.
+      try {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.copyFileSync(boardFile, `${boardFile}.corrupt-${stamp}`);
+      } catch (copyError) {
+        console.error('[kanban] не удалось сохранить копию повреждённого файла:', copyError.message);
+      }
     }
     return null;
   }
@@ -97,12 +108,20 @@ function rotateBackup() {
   }
 }
 
+function revisionOf(payload) {
+  return Number.isFinite(payload && payload.revision) ? payload.revision : null;
+}
+
 function writeBoard(payload) {
+  const revision = revisionOf(payload);
+  if (revision !== null && revision < lastWriteRevision) return { skipped: true };
   const text = validateBoardPayload(payload);
   rotateBackup();
   const tempFile = `${boardFile}.tmp`;
   fs.writeFileSync(tempFile, text, 'utf8');
   fs.renameSync(tempFile, boardFile);
+  if (revision !== null) lastWriteRevision = revision;
+  return { skipped: false };
 }
 
 // Очередь асинхронных записей: рендерер не ждёт диск (invoke),
@@ -110,12 +129,18 @@ function writeBoard(payload) {
 let saveQueue = Promise.resolve();
 
 function writeBoardAsync(payload) {
+  const revision = revisionOf(payload);
   const text = validateBoardPayload(payload);
-  saveQueue = saveQueue.then(() => {
+  // catch перед then: одна ошибка диска не должна «отравлять» очередь —
+  // иначе все последующие автосохранения падают, не доходя до записи.
+  saveQueue = saveQueue.catch(() => {}).then(() => {
+    if (revision !== null && revision < lastWriteRevision) return { skipped: true };
     rotateBackup();
     const tempFile = `${boardFile}.tmp`;
     fs.writeFileSync(tempFile, text, 'utf8');
     fs.renameSync(tempFile, boardFile);
+    if (revision !== null) lastWriteRevision = revision;
+    return { skipped: false };
   });
   return saveQueue;
 }
@@ -128,8 +153,8 @@ function registerIpc() {
   // Синхронный путь оставлен для выгрузки (beforeunload) и смоук-проверок.
   ipcMain.on('board:save-sync', (event, payload) => {
     try {
-      writeBoard(payload);
-      event.returnValue = { ok: true };
+      const result = writeBoard(payload);
+      event.returnValue = { ok: true, skipped: Boolean(result && result.skipped) };
     } catch (error) {
       console.error('[kanban] ошибка сохранения:', error.message);
       event.returnValue = { ok: false, error: error.message };
@@ -139,8 +164,8 @@ function registerIpc() {
   // Основной путь: асинхронный, рендерер продолжает жить без фриза.
   ipcMain.handle('board:save', async (event, payload) => {
     try {
-      await writeBoardAsync(payload);
-      return { ok: true };
+      const result = await writeBoardAsync(payload);
+      return { ok: true, skipped: Boolean(result && result.skipped) };
     } catch (error) {
       console.error('[kanban] ошибка сохранения:', error.message);
       return { ok: false, error: error.message };
@@ -157,6 +182,8 @@ function registerIpc() {
     });
     if (canceled || !filePath) return { ok: false, reason: 'cancelled' };
     try {
+      // Дожидаемся очереди: экспорт не должен поймать файл до последней записи.
+      await saveQueue.catch(() => {});
       const raw = fs.readFileSync(boardFile, 'utf8');
       fs.writeFileSync(filePath, raw, 'utf8');
       return { ok: true, filePath };
@@ -194,6 +221,16 @@ function registerIpc() {
 
   ipcMain.on('smoke:log', (event, message) => {
     console.log(`[smoke] ${message}`);
+  });
+
+  // Копирование выделенного текста из всплывающего тулбара стикера.
+  ipcMain.handle('clipboard:write', (event, text) => {
+    try {
+      clipboard.writeText(String(text == null ? '' : text));
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
   });
 
   ipcMain.on('smoke:done', async (event, passed) => {
@@ -300,7 +337,7 @@ function createWindow() {
 function bootstrap() {
   nativeTheme.themeSource = 'light';
   boardFile = resolveBoardFile();
-  if (SMOKE) {
+  if (SMOKE || SHOT) {
     try {
       fs.rmSync(boardFile, { force: true });
     } catch (error) {

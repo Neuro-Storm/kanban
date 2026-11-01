@@ -33,6 +33,7 @@
 
       <div class="actions">
         <select id="themeSelect" class="theme-select" title="Тема доски"></select>
+        <button id="arrangeBtn" class="btn btn-ghost" type="button" title="Разложить стикеры по колонкам ровными стопками">Упорядочить</button>
         <button id="exportBtn" class="btn btn-ghost" type="button" title="Сохранить копию доски в файл">Экспорт</button>
         <button id="importBtn" class="btn btn-ghost" type="button" title="Загрузить доску из файла">Импорт</button>
         <button id="bulkDeleteBtn" class="btn btn-ghost-danger" type="button" hidden>Удалить</button>
@@ -41,7 +42,9 @@
 
     <main class="board-stage">
       <aside class="board-tabs" aria-label="Доски проектов">
+        <button id="boardsScrollUp" class="boards-scroll" type="button" title="Прокрутить вкладки вверх" hidden>▲</button>
         <div class="boards-list" id="boardsList" role="tablist" aria-label="Доски"></div>
+        <button id="boardsScrollDown" class="boards-scroll" type="button" title="Прокрутить вкладки вниз" hidden>▼</button>
         <button id="addBoardBtn" class="boards-add" type="button" title="Новая доска">＋</button>
       </aside>
       <div class="board-wrap">

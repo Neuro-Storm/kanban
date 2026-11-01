@@ -27,6 +27,9 @@ contextBridge.exposeInMainWorld('kanbanAPI', {
   exportBoard: () => ipcRenderer.invoke('board:export'),
   importBoard: () => ipcRenderer.invoke('board:import'),
 
+  // Копирование выделения из тулбара форматирования (без доступа к файлам).
+  copyText: (text) => ipcRenderer.invoke('clipboard:write', String(text == null ? '' : text)),
+
   smokeLog: (message) => ipcRenderer.send('smoke:log', String(message)),
   smokeDone: (passed) => ipcRenderer.send('smoke:done', Boolean(passed)),
 });

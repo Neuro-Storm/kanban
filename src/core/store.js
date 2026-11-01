@@ -47,6 +47,7 @@
   const THEMES = [
     { id: 'kraft', label: 'Крафт' },
     { id: 'rice', label: 'Рисовая бумага' },
+    { id: 'blue', label: 'Голубая' },
     { id: 'cork', label: 'Пробковая доска' },
     { id: 'graphite', label: 'Графит' },
     { id: 'chalk', label: 'Меловая доска' },
@@ -100,6 +101,7 @@
   // Текст без разметки — для проверок пустоты и поиска.
   function strippedText(html) {
     return String(html || '')
+      .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<[^>]*>/g, '')
       .replace(/&nbsp;/gi, ' ')
       .replace(/&amp;/gi, '&')
@@ -235,6 +237,7 @@
       columns: DEFAULT_COLUMNS.map((column) => Object.assign({}, column)),
       tasks,
       theme: DEFAULT_THEME,
+      layout: null,
     };
   }
 
@@ -245,7 +248,10 @@
   function sanitizeColumn(raw) {
     if (!isPlainObject(raw)) return null;
     const id = typeof raw.id === 'string' ? raw.id.trim() : '';
-    if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
+    // ID колонки может быть кириллическим: UI строит его из названия
+    // («Колонка 6» → «колонка-6»), и такие колонки должны переживать
+    // перезапуск. Раньше здесь был ASCII-only шаблон — колонки терялись.
+    if (!id || !/^[\p{L}\p{N}_-]+$/u.test(id)) return null;
     let wipLimit = null;
     if (Number.isInteger(raw.wipLimit) && raw.wipLimit > 0) wipLimit = raw.wipLimit;
     const role = raw.role === 'done' || raw.role === 'pool' ? raw.role : null;
@@ -309,6 +315,33 @@
     };
   }
 
+  // Геометрия дорожек, на которой стикеры лежали в прошлый раз.
+  // Нужна, чтобы при открытии доски в другом размере окна (или после
+  // масштабирования) пересчитать X относительно СВОИХ дорожек, а не
+  // оставить стикеры на координатах чужой геометрии. Хранится в board.layout.
+  function sanitizeBoardLayout(raw) {
+    if (!isPlainObject(raw)) return null;
+    const boardWidth = Number(raw.boardWidth);
+    const lanesRaw = Array.isArray(raw.lanes) ? raw.lanes : [];
+    const lanes = [];
+    const seen = new Set();
+    for (const lane of lanesRaw) {
+      if (!isPlainObject(lane)) continue;
+      const id = typeof lane.id === 'string' ? lane.id.trim() : '';
+      const left = Number(lane.left);
+      const right = Number(lane.right);
+      if (!id || seen.has(id)) continue;
+      if (!Number.isFinite(left) || !Number.isFinite(right) || right < left) continue;
+      seen.add(id);
+      lanes.push({ id, left: Math.round(left), right: Math.round(right) });
+    }
+    if (!lanes.length) return null;
+    return {
+      boardWidth: Number.isFinite(boardWidth) && boardWidth > 0 ? Math.round(boardWidth) : 0,
+      lanes,
+    };
+  }
+
   function sanitizeBoard(raw, now) {
     const issues = [];
     if (!isPlainObject(raw)) {
@@ -361,7 +394,7 @@
       fresh.push(task);
     }
 
-    const board = { columns, tasks: fresh };
+    const board = { columns, tasks: fresh, layout: sanitizeBoardLayout(raw.layout) };
     // Тема в доске не хранится (v2: единая на пространство).
     // sanitizeWorkspace и replaceAll забирают raw.theme отдельно.
     const repairedNow = normalizeOrders(board);
@@ -416,7 +449,7 @@
 
   // Пустая доска для новых проектов: те же колонки, без демо-стикеров.
   function emptyBoardData() {
-    return { columns: DEFAULT_COLUMNS.map((column) => Object.assign({}, column)), tasks: [] };
+    return { columns: DEFAULT_COLUMNS.map((column) => Object.assign({}, column)), tasks: [], layout: null };
   }
 
   function sanitizeBoardEntry(raw, now, seenIds, fallbackName) {
@@ -583,6 +616,11 @@
       this._listeners = new Set();
       this._saveTimer = null;
       this._dirty = false;
+      this._savesInFlight = 0;
+      // Ревизия — не счётчик с нуля, а текущее время: после перезагрузки
+      // рендерера новая сессия не получит ревизию меньше прошлой и не
+      // «застрянет» на защите от старых записей в главном процессе.
+      this._revision = this._clock();
       this._lastSavedAt = 0;
       this._saveError = null;
       this._loadReport = { seeded: false, repaired: false, issues: [] };
@@ -621,6 +659,7 @@
       this._syncActiveRef();
       if (this._loadReport.seeded || this._loadReport.repaired) {
         this._dirty = true;
+        this._revision += 1;
         this._scheduleSave(0);
       }
       return Object.assign({}, this._loadReport);
@@ -735,6 +774,131 @@
       this._syncActiveRef();
       this._afterChange('board-switch');
       return { ok: true, board: { id } };
+    }
+
+    // Ручной порядок вкладок: массив id в новом порядке, все доски обязательны.
+    reorderBoards(orderedIds) {
+      const ids = Array.isArray(orderedIds)
+        ? orderedIds.filter((id) => typeof id === 'string' && id)
+        : [];
+      if (ids.length !== this._boards.length || new Set(ids).size !== ids.length) {
+        return { ok: false, reason: 'bad-list' };
+      }
+      const byId = new Map(this._boards.map((entry) => [entry.id, entry]));
+      const ordered = [];
+      for (const id of ids) {
+        const entry = byId.get(id);
+        if (!entry) return { ok: false, reason: 'unknown-board' };
+        ordered.push(entry);
+      }
+      this._boards = ordered;
+      this._afterChange('board-reorder');
+      return { ok: true, order: ids.slice() };
+    }
+
+    /**
+     * Перенос стикеров на другую доску (drag на вкладку).
+     * Стикеры кладутся в «Пул задач» целевой доски (или первую колонку),
+     * WIP-лимит проверяется общим числом. Координаты сбрасываются —
+     * UI разложит их после переключения на целевую доску.
+     */
+    transferTasks(taskIds, boardId, options) {
+      const opts = options || {};
+      const ids = Array.isArray(taskIds)
+        ? [...new Set(taskIds.filter((id) => typeof id === 'string' && id))]
+        : [];
+      if (!ids.length) return { ok: false, reason: 'empty' };
+      const targetEntry = this._boards.find((entry) => entry.id === boardId);
+      if (!targetEntry) return { ok: false, reason: 'not-found' };
+      const sourceEntry = opts.sourceBoardId
+        ? this._boards.find((entry) => entry.id === opts.sourceBoardId)
+        : this._activeEntry();
+      if (!sourceEntry) return { ok: false, reason: 'not-found' };
+      if (sourceEntry.id === targetEntry.id) return { ok: false, reason: 'same-board' };
+      const sourceBoard = sourceEntry.board;
+      const moving = [];
+      for (const id of ids) {
+        const task = sourceBoard.tasks.find((entry) => entry.id === id);
+        if (task && task.deletedAt === null) moving.push(task);
+      }
+      if (!moving.length) return { ok: false, reason: 'not-found' };
+
+      const targetBoard = targetEntry.board;
+      const requestedColumn = opts.targetColumnId
+        ? targetBoard.columns.find((entry) => entry.id === opts.targetColumnId)
+        : null;
+      const column =
+        requestedColumn ||
+        targetBoard.columns.find((entry) => entry.role === 'pool') ||
+        targetBoard.columns[0];
+      if (!column) return { ok: false, reason: 'no-columns' };
+      const activeInTarget = targetBoard.tasks.filter(
+        (task) => task.columnId === column.id && task.deletedAt === null
+      ).length;
+      if (column.wipLimit !== null && activeInTarget + moving.length > column.wipLimit) {
+        return {
+          ok: false,
+          reason: 'wip',
+          columnId: column.id,
+          columnTitle: column.title,
+          limit: column.wipLimit,
+        };
+      }
+
+      moving.sort((a, b) => {
+        const ay = Number.isFinite(a.y) ? a.y : Number.POSITIVE_INFINITY;
+        const by = Number.isFinite(b.y) ? b.y : Number.POSITIVE_INFINITY;
+        if (ay !== by) return ay - by;
+        return compareByOrder(a, b);
+      });
+
+      const now = this._clock();
+      const still = targetBoard.tasks
+        .filter((task) => task.columnId === column.id && task.deletedAt === null)
+        .sort(compareByOrder);
+      let nextOrder = still.length ? still[still.length - 1].order + 1000 : 1000;
+      const movingSet = new Set(moving.map((task) => task.id));
+      sourceBoard.tasks = sourceBoard.tasks.filter((task) => !movingSet.has(task.id));
+      for (const task of moving) {
+        task.columnId = column.id;
+        task.order = nextOrder;
+        nextOrder += 1000;
+        task.x = Number.isFinite(opts.x)
+          ? Math.max(-100000, Math.min(100000, Math.round(opts.x)))
+          : null;
+        task.y = Number.isFinite(opts.y)
+          ? Math.max(-100000, Math.min(100000, Math.round(opts.y)))
+          : null;
+        task.updatedAt = now;
+        targetBoard.tasks.push(task);
+      }
+      this._afterChange('board-transfer', moving[0]);
+      return {
+        ok: true,
+        boardId,
+        sourceBoardId: sourceEntry.id,
+        columnId: column.id,
+        count: moving.length,
+      };
+    }
+
+    // -- геометрия доски для рефлоу X -------------------------------------
+
+    getBoardLayout() {
+      if (!this._board || !this._board.layout) return null;
+      return JSON.parse(JSON.stringify(this._board.layout));
+    }
+
+    setBoardLayout(layout) {
+      if (!this._board) return { ok: false, reason: 'no-board' };
+      const clean = sanitizeBoardLayout(layout);
+      const previous = this._board.layout ? sanitizeBoardLayout(this._board.layout) : null;
+      if (JSON.stringify(clean) === JSON.stringify(previous)) return { ok: true, skipped: true };
+      this._board.layout = clean;
+      this._dirty = true;
+      this._revision += 1;
+      this._scheduleSave(this._autosaveMs);
+      return { ok: true };
     }
 
     // -- чтение ----------------------------------------------------------
@@ -1047,15 +1211,20 @@
         if (!entry || typeof entry.id !== 'string') continue;
         const task = this._findTask(entry.id);
         if (!task || task.deletedAt !== null) continue;
-        if (!Number.isFinite(entry.x)) continue;
-        const nextX = Math.max(-100000, Math.min(100000, Math.round(entry.x)));
-        if (task.x === nextX) continue;
+        const hasX = Number.isFinite(entry.x);
+        const hasY = Number.isFinite(entry.y);
+        if (!hasX && !hasY) continue;
+        const nextX = hasX ? Math.max(-100000, Math.min(100000, Math.round(entry.x))) : task.x;
+        const nextY = hasY ? Math.max(-100000, Math.min(100000, Math.round(entry.y))) : task.y;
+        if (task.x === nextX && task.y === nextY) continue;
         task.x = nextX;
+        task.y = nextY;
         task.updatedAt = now;
         updated += 1;
       }
       if (!updated) return { ok: true, updated: 0, skipped: true };
       this._dirty = true;
+      this._revision += 1;
       this._scheduleSave(0);
       this._emit({ type: 'change', reason: 'reflow' });
       return { ok: true, updated };
@@ -1132,7 +1301,7 @@
       if (!clean) return { ok: false, reason: 'empty-title' };
       const base = clean
         .toLocaleLowerCase('ru')
-        .replace(/[^a-zа-яё0-9]+/gi, '-')
+        .replace(/[^\p{L}\p{N}]+/gu, '-')
         .replace(/^-+|-+$/g, '')
         .slice(0, 24) || 'col';
       let id = base;
@@ -1220,6 +1389,7 @@
       return {
         version: SCHEMA_VERSION,
         savedAt: this._clock(),
+        revision: this._revision,
         activeBoardId: this._activeBoardId,
         theme: this._theme,
         boards: JSON.parse(JSON.stringify(this._boards)),
@@ -1229,6 +1399,7 @@
     _afterChange(reason, task, column) {
       const delay = reason === 'update' ? this._autosaveMs : 0;
       this._dirty = true;
+      this._revision += 1;
       this._scheduleSave(delay);
       this._emit({ type: 'change', reason, task: task ? cloneTask(task) : null, column: column || null });
     }
@@ -1254,10 +1425,15 @@
         return { ok: true, savedAt: this._lastSavedAt, skipped: true };
       }
       const payload = this._workspacePayload();
+      // Сбрасываем dirty ДО записи. Если пользователь что-то изменит, пока
+      // промис летит, _afterChange снова поставит true — и правка не потеряется
+      // (раньше успешный ответ старой записи гасил флаг новой правки).
+      this._dirty = false;
       let result;
       try {
         result = this._storage.save(payload);
       } catch (error) {
+        this._dirty = true;
         this._saveError = error.message || String(error);
         this._emit({ type: 'save-error', error: this._saveError });
         return { ok: false, error: this._saveError };
@@ -1266,27 +1442,35 @@
       // статус подтянется событием 'saved' по резолву. invoke отдаёт
       // {ok:false} резолвом, а не броском — проверяем флаг явно.
       if (result && typeof result.then === 'function') {
+        this._savesInFlight += 1;
         return result.then(
           (response) => {
+            this._savesInFlight = Math.max(0, this._savesInFlight - 1);
             if (response && response.ok === false) {
+              this._dirty = true;
               this._saveError = response.error || 'запись не удалась';
               this._emit({ type: 'save-error', error: this._saveError });
               return { ok: false, error: this._saveError };
             }
-            this._dirty = false;
+            // Ответ мог быть пропущен главным процессом: более свежая
+            // синхронная запись уже легла на диск.
+            if (response && response.skipped) {
+              return { ok: true, savedAt: this._lastSavedAt, skipped: true };
+            }
             this._lastSavedAt = payload.savedAt;
             this._saveError = null;
             this._emit({ type: 'saved', savedAt: payload.savedAt });
             return { ok: true, savedAt: payload.savedAt };
           },
           (error) => {
+            this._savesInFlight = Math.max(0, this._savesInFlight - 1);
+            this._dirty = true;
             this._saveError = (error && error.message) || String(error);
             this._emit({ type: 'save-error', error: this._saveError });
             return { ok: false, error: this._saveError };
           }
         );
       }
-      this._dirty = false;
       this._lastSavedAt = payload.savedAt;
       this._saveError = null;
       this._emit({ type: 'saved', savedAt: payload.savedAt });
@@ -1303,27 +1487,35 @@
         clearTimeout(this._saveTimer);
         this._saveTimer = null;
       }
-      if (!this._dirty) return { ok: true, savedAt: this._lastSavedAt, skipped: true };
+      if (!this._dirty) {
+        // Есть незавершённая асинхронная запись — выгрузке стоит подождать.
+        if (this._savesInFlight > 0) {
+          return { ok: false, error: 'async-pending', asyncPending: true };
+        }
+        return { ok: true, savedAt: this._lastSavedAt, skipped: true };
+      }
       if (!this._storage) {
         this._dirty = false;
         return { ok: true, savedAt: this._lastSavedAt, skipped: true };
       }
       const payload = this._workspacePayload();
+      this._dirty = false;
       try {
         if (typeof this._storage.saveSync === 'function') {
           this._storage.saveSync(payload);
         } else {
           const result = this._storage.save(payload);
           if (result && typeof result.then === 'function') {
+            this._dirty = true;
             return { ok: false, error: 'async-pending', asyncPending: true };
           }
         }
-        this._dirty = false;
         this._lastSavedAt = payload.savedAt;
         this._saveError = null;
         this._emit({ type: 'saved', savedAt: payload.savedAt });
         return { ok: true, savedAt: payload.savedAt };
       } catch (error) {
+        this._dirty = true;
         this._saveError = error.message || String(error);
         this._emit({ type: 'save-error', error: this._saveError });
         return { ok: false, error: this._saveError };
@@ -1365,7 +1557,7 @@
 
     /** Отложенная запись ещё висит? (для тестов и сценария выхода) */
     hasPendingSave() {
-      return this._dirty || this._saveTimer !== null;
+      return this._dirty || this._saveTimer !== null || this._savesInFlight > 0;
     }
   }
 
