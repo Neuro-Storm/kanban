@@ -3627,13 +3627,108 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Витрина для кадров README (--shot): пять досок и живые задачи.
+  // Собирается только в режиме съёмки, данные пользователя не трогает.
+  // ---------------------------------------------------------------------
+
+  function addShotTasks(tasks) {
+    for (const task of tasks) store.createTask(task);
+  }
+
+  function buildShotScene() {
+    const workId = store.activeBoardId();
+    store.renameBoard(workId, 'Работа');
+    for (const task of store.snapshot().tasks) store.deleteTask(task.id);
+
+    addShotTasks([
+      {
+        columnId: 'pool',
+        text: 'Продумать структуру лендинга\nПервый экран, преимущества, отзывы, форма заявки.',
+        tag: 'idea',
+        color: 'mint',
+      },
+      { columnId: 'pool', text: 'Собрать вопросы к созвону', tag: 'work', color: 'yellow' },
+      { columnId: 'pool', text: 'Обновить портфолио', tag: 'personal', color: 'blue' },
+      {
+        columnId: 'urgent',
+        text: 'Отправить смету до пятницы\nКлиент ждёт цифры: бюджет, сроки, состав работ.',
+        tag: 'urgent',
+        color: 'pink',
+        priority: true,
+        dueDate: Core.localDateString(Date.now() + 2 * 24 * 60 * 60 * 1000),
+      },
+      { columnId: 'in-progress', text: 'Ревью пул-реквеста:\nмодуль экспорта', tag: 'work', color: 'yellow' },
+      { columnId: 'in-progress', text: 'Переписать экран настроек', tag: 'work', color: 'mint' },
+      { columnId: 'waiting', text: 'Ответ от дизайнера по логотипу', tag: 'work', color: 'lilac' },
+      { columnId: 'waiting', text: 'Счёт за хостинг — ждём оплату', tag: 'work', color: 'peach' },
+      { columnId: 'done', text: 'Настроить автосохранение доски', tag: 'work', color: 'mint' },
+      { columnId: 'done', text: 'Перенести заметки в канбан', tag: 'personal', color: 'blue' },
+    ].reverse());
+
+    const otherBoards = [
+      {
+        name: 'Учёба',
+        tasks: [
+          { columnId: 'pool', text: 'Дочитать главу про алгоритмы', tag: 'study', color: 'blue' },
+          { columnId: 'in-progress', text: 'Конспект по базам данных', tag: 'study', color: 'mint' },
+          { columnId: 'done', text: 'Сдать лабораторную №4', tag: 'study', color: 'yellow' },
+        ],
+      },
+      {
+        name: 'Дом',
+        tasks: [
+          { columnId: 'pool', text: 'Заменить лампочку на кухне', tag: 'personal', color: 'yellow' },
+          { columnId: 'waiting', text: 'Заказать полки в коридор', tag: 'personal', color: 'peach' },
+          { columnId: 'done', text: 'Разобрать шкаф', tag: 'personal', color: 'mint' },
+        ],
+      },
+      {
+        name: 'Поездка',
+        tasks: [
+          { columnId: 'pool', text: 'Забронировать отель в Тбилиси', tag: 'personal', color: 'blue' },
+          {
+            columnId: 'urgent',
+            text: 'Проверить срок загранпаспорта',
+            tag: 'urgent',
+            color: 'pink',
+            dueDate: Core.localDateString(Date.now() + 14 * 24 * 60 * 60 * 1000),
+          },
+          { columnId: 'done', text: 'Скачать офлайн-карты', tag: 'personal', color: 'lilac' },
+        ],
+      },
+      {
+        name: 'Идеи',
+        tasks: [
+          { columnId: 'pool', text: 'Приложение для учёта привычек', tag: 'idea', color: 'mint' },
+          { columnId: 'pool', text: 'Статья про локальные данные', tag: 'idea', color: 'yellow' },
+          { columnId: 'waiting', text: 'Настольная игра про канбан', tag: 'idea', color: 'lilac' },
+        ],
+      },
+    ];
+
+    for (const board of otherBoards) {
+      const created = store.createBoard(board.name);
+      if (created.ok) addShotTasks(board.tasks);
+    }
+
+    store.switchBoard(workId);
+    store.setTheme('blue');
+  }
+
   if (SMOKE) {
     runSmokeTest();
   } else {
     startup();
-    // Для превью редактора: открываем стикер автоматически.
-    if (SHOT && query.has('editor')) {
-      setTimeout(() => openEditor('seed-3'), 250);
+    if (SHOT) {
+      // Ждём шрифты, чтобы стопки стикеров встали по реальным размерам.
+      const fontsReady =
+        document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+      fontsReady.then(() => {
+        buildShotScene();
+        arrangeBoard();
+        dom.toasts.replaceChildren();
+      });
     }
   }
   // ---------------------------------------------------------------------

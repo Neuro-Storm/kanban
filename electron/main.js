@@ -14,10 +14,9 @@ const path = require('path');
 const os = require('os');
 
 const SMOKE = process.argv.includes('--smoke');
-const SHOT_EDITOR = process.argv.includes('--shot-editor');
 const THEME_ARG = process.argv.find((arg) => arg.startsWith('--theme='));
 const THEME = THEME_ARG ? THEME_ARG.slice('--theme='.length) : null;
-const SHOT = process.argv.includes('--shot') || SHOT_EDITOR;
+const SHOT = process.argv.includes('--shot');
 const MAX_BOARD_BYTES = 5 * 1024 * 1024;
 const SMOKE_TIMEOUT_MS = 90 * 1000;
 const SHOT_TIMEOUT_MS = 60 * 1000;
@@ -292,7 +291,7 @@ function createWindow() {
   const query = Object.assign(
     {},
     SMOKE ? { smoke: '1' } : {},
-    SHOT ? { shot: '1', ...(SHOT_EDITOR ? { editor: '1' } : {}) } : {},
+    SHOT ? { shot: '1' } : {},
     THEME ? { theme: THEME } : {}
   );
   mainWindow.loadFile(path.join(__dirname, '..', 'src', 'ui', 'index.html'), {
